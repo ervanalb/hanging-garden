@@ -9,7 +9,7 @@
   },
   "GeneralSpecs": {
     "ProjectId": {
-      "Name": "hanging-garden-pcb",
+      "Name": "kelp-pcb",
       "GUID": "68616e67-696e-4672-9d67-617264656e2d",
       "Revision": "rev?"
     },
@@ -41,57 +41,57 @@
   ],
   "FilesAttributes": [
     {
-      "Path": "hanging-garden-pcb-F_Cu.gbr",
+      "Path": "kelp-pcb-F_Cu.gbr",
       "FileFunction": "Copper,L1,Top",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-In1_Cu.gbr",
+      "Path": "kelp-pcb-In1_Cu.gbr",
       "FileFunction": "Copper,L2,Inr",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-In2_Cu.gbr",
+      "Path": "kelp-pcb-In2_Cu.gbr",
       "FileFunction": "Copper,L3,Inr",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-B_Cu.gbr",
+      "Path": "kelp-pcb-B_Cu.gbr",
       "FileFunction": "Copper,L4,Bot",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-F_Paste.gbr",
+      "Path": "kelp-pcb-F_Paste.gbr",
       "FileFunction": "SolderPaste,Top",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-B_Paste.gbr",
+      "Path": "kelp-pcb-B_Paste.gbr",
       "FileFunction": "SolderPaste,Bot",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-F_Silkscreen.gbr",
+      "Path": "kelp-pcb-F_Silkscreen.gbr",
       "FileFunction": "Legend,Top",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-B_Silkscreen.gbr",
+      "Path": "kelp-pcb-B_Silkscreen.gbr",
       "FileFunction": "Legend,Bot",
       "FilePolarity": "Positive"
     },
     {
-      "Path": "hanging-garden-pcb-F_Mask.gbr",
+      "Path": "kelp-pcb-F_Mask.gbr",
       "FileFunction": "SolderMask,Top",
       "FilePolarity": "Negative"
     },
     {
-      "Path": "hanging-garden-pcb-B_Mask.gbr",
+      "Path": "kelp-pcb-B_Mask.gbr",
       "FileFunction": "SolderMask,Bot",
       "FilePolarity": "Negative"
     },
     {
-      "Path": "hanging-garden-pcb-Edge_Cuts.gbr",
+      "Path": "kelp-pcb-Edge_Cuts.gbr",
       "FileFunction": "Profile",
       "FilePolarity": "Positive"
     }

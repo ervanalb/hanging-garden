@@ -376,7 +376,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/c117cd0f-bfe5-4a8f-a0e3-e3f89da7f015")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -536,7 +536,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/962eff7d-bf42-4025-bf19-294320e46fc1")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -696,7 +696,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/674ca2b5-e72f-4ceb-b39a-c4056602e2b7")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -849,7 +849,7 @@
 		(property ki_fp_filters "SW*MEC*5G*")
 		(path "/455d6b93-af06-4b8f-9686-b8590f8a8c68")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -1727,7 +1727,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/0916f020-a2c1-459a-a33d-fe1a2138eb28")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -1887,7 +1887,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/3b9f18f8-9920-4e18-b3be-3cb4c252ce57")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -2047,7 +2047,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/3626e9c3-4d45-47de-9cca-c54530b80ee0")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -2199,7 +2199,7 @@
 		(property ki_fp_filters "Connector*:*_1x??_*")
 		(path "/fb8a9883-80d4-4a94-a861-12df52fba585")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -2314,7 +2314,7 @@
 		(property ki_fp_filters "Connector*:*_1x??_*")
 		(path "/2ef691b5-96f3-4f66-b5b7-88fd06cf486f")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -2688,7 +2688,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/27bed3bd-d2ab-44e5-a94d-411b018d89fe")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -2848,7 +2848,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/f7571ccc-9a1f-49db-a8d1-2131803166f2")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -3168,7 +3168,7 @@
 		(property ki_fp_filters "SOT?23?3*")
 		(path "/b3078080-3775-457a-8073-8f889a260a12")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -3544,7 +3544,7 @@
 		(property ki_fp_filters "Connector*:*_1x??_*")
 		(path "/160afe14-53bb-4af5-81cd-05655b2ab864")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -3726,7 +3726,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/a1fffa01-245d-4718-8284-2f81c03f2016")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -3886,7 +3886,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/fe132369-164a-498f-b9e1-32ecead93d24")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -4045,7 +4045,7 @@
 		)
 		(path "/6ac71dea-496e-44b6-ac64-04b52d0d37ad")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -4429,7 +4429,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/fc5e82bd-bff2-43fb-a8ec-5c0cdb914639")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -4589,7 +4589,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/2c6e5921-7c6f-45db-94b5-c62638d7a6f2")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -4749,7 +4749,7 @@
 		(property ki_fp_filters "R_*")
 		(path "/635524c7-68fc-4ad0-8b79-141aba235cc8")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -4909,7 +4909,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/e8cdbb41-ccbc-4483-8577-ad2827d06194")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -5240,7 +5240,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/c241b7b2-8192-45eb-9f6a-4cd21fb0adaa")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -5407,7 +5407,7 @@
 		(property ki_fp_filters "Connector*:*_1x??_*")
 		(path "/8c27542c-050a-4fe4-8a7f-5d4154018e40")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -5609,7 +5609,7 @@
 		(property ki_fp_filters "Crystal*")
 		(path "/a1e99278-437e-477c-98c1-481286c2acbc")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -6130,7 +6130,7 @@
 		(property ki_fp_filters "LQFP*7x7mm*P0.5mm*")
 		(path "/dcdaa868-d4a5-44da-8627-859d20478d01")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -7313,7 +7313,7 @@
 		(property ki_fp_filters "C_*")
 		(path "/85b9083c-0401-4c16-a861-9898abec2d57")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")
@@ -7470,7 +7470,7 @@
 		(property ki_fp_filters "Connector*:*_1x??_*")
 		(path "/3daecb89-8834-4e9b-83ee-81cffd30caae")
 		(sheetname "/")
-		(sheetfile "hanging-garden-pcb.kicad_sch")
+		(sheetfile "kelp-pcb.kicad_sch")
 		(units
 			(unit
 				(name "A")

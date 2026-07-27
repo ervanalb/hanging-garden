@@ -504,7 +504,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "hanging-garden-pcb.kicad_pro",
+    "filename": "kelp-pcb.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -659,7 +659,7 @@
     "subpart_id_separator": 0,
     "top_level_sheets": [
       {
-        "filename": "hanging-garden-pcb.kicad_sch",
+        "filename": "kelp-pcb.kicad_sch",
         "name": "Root",
         "uuid": "f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
       }

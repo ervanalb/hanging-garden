@@ -4597,7 +4597,7 @@
 			(uuid "35f17eca-9418-4b5b-b451-1fb22dd75c68")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C1")
 					(unit 1)
@@ -4675,7 +4675,7 @@
 			(uuid "6d19579b-f093-44c6-a178-91c43c961a42")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR014")
 					(unit 1)
@@ -4758,7 +4758,7 @@
 			(uuid "eededefc-d0ef-485b-8696-930f403f2431")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "J1")
 					(unit 1)
@@ -4836,7 +4836,7 @@
 			(uuid "36997cc7-ac71-4f3b-a616-e6063cc98d7e")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR05")
 					(unit 1)
@@ -4914,7 +4914,7 @@
 			(uuid "78e81e9f-d116-4962-82ca-a219c85ce954")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR018")
 					(unit 1)
@@ -4992,7 +4992,7 @@
 			(uuid "1016bbeb-43ce-4bf4-aeac-fadb2a96792f")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR019")
 					(unit 1)
@@ -5072,7 +5072,7 @@
 			(uuid "ee73fbbf-3f2e-4341-8ff0-8b5af0be8c22")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R3")
 					(unit 1)
@@ -5151,7 +5151,7 @@
 			(uuid "8bf3dc4f-0a5d-4488-a9ef-aaf374a6d9db")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR04")
 					(unit 1)
@@ -5233,7 +5233,7 @@
 			(uuid "af17fa19-c007-4401-9c7e-56cfcd8de48d")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C7")
 					(unit 1)
@@ -5312,7 +5312,7 @@
 			(uuid "084b3d33-0da0-4fa4-acbe-25a5c9c6dcb1")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR07")
 					(unit 1)
@@ -5391,7 +5391,7 @@
 			(uuid "c2e9b8ce-926e-4112-9561-dc6c568097a9")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "J3")
 					(unit 1)
@@ -5471,7 +5471,7 @@
 			(uuid "da207011-a68a-4d12-9e88-93c87aa20f64")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R8")
 					(unit 1)
@@ -5548,7 +5548,7 @@
 			(uuid "1ddd58cf-407b-49c1-a1f3-d8a07fbaa254")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR012")
 					(unit 1)
@@ -5630,7 +5630,7 @@
 			(uuid "d387e63c-6591-4e07-ac5f-cdd8817214d1")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R7")
 					(unit 1)
@@ -5713,7 +5713,7 @@
 			(uuid "57e39794-9a17-4834-9e8b-a76371cf5910")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "J2")
 					(unit 1)
@@ -5790,7 +5790,7 @@
 			(uuid "e5998e02-43f3-44a3-9382-44422c224272")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR022")
 					(unit 1)
@@ -5878,7 +5878,7 @@
 			(uuid "268a27be-6c3b-42e9-bc55-0184d7c3e5f1")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "SW1")
 					(unit 1)
@@ -5956,7 +5956,7 @@
 			(uuid "c78f59fe-eb97-4966-aab7-523d0688ff56")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR08")
 					(unit 1)
@@ -6039,7 +6039,7 @@
 			(uuid "182c3a69-b220-4799-b388-6a1dd3edd43a")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R4")
 					(unit 1)
@@ -6121,7 +6121,7 @@
 			(uuid "0b4681a2-c6b1-4e58-832c-f17cad1231a6")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C6")
 					(unit 1)
@@ -6206,7 +6206,7 @@
 			(uuid "98698695-db8e-4964-8448-0c9abd117487")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "Q2")
 					(unit 1)
@@ -6283,7 +6283,7 @@
 			(uuid "1b0bbf1f-ac36-422e-8e05-16ada84f70e5")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR016")
 					(unit 1)
@@ -6360,7 +6360,7 @@
 			(uuid "9b925290-9c87-4931-8c08-2ddf26802c99")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR09")
 					(unit 1)
@@ -6443,7 +6443,7 @@
 			(uuid "76a9f1b4-b5b3-4d7c-9fee-9fd2dec55dae")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C3")
 					(unit 1)
@@ -6532,7 +6532,7 @@
 			(uuid "29986cfe-a9c9-43f2-bb78-a35bdb0d7f67")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "J5")
 					(unit 1)
@@ -6610,7 +6610,7 @@
 			(uuid "919a4e6a-17f2-47da-b5e4-df52594bcc25")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR021")
 					(unit 1)
@@ -6688,7 +6688,7 @@
 			(uuid "63cd2d1e-6f3d-4c1c-9bab-0fa56aca0f8d")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR02")
 					(unit 1)
@@ -6766,7 +6766,7 @@
 			(uuid "3c841c67-63e4-48c1-b6f9-109f1bbf8695")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR010")
 					(unit 1)
@@ -6848,7 +6848,7 @@
 			(uuid "b3fe9cc4-1cb9-426a-8baf-d0b5e2e06f7f")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R5")
 					(unit 1)
@@ -6925,7 +6925,7 @@
 			(uuid "bfa195d1-ce60-4688-aa92-eeb7a6f7051c")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR020")
 					(unit 1)
@@ -7003,7 +7003,7 @@
 			(uuid "599e0e00-2a1c-4181-88a8-de66a9045e31")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR03")
 					(unit 1)
@@ -7080,7 +7080,7 @@
 			(uuid "fbceaea1-1a37-4630-aaef-e9946541c07f")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR06")
 					(unit 1)
@@ -7188,7 +7188,7 @@
 			(uuid "581ae64c-8376-49e3-9bfb-586c256b46f0")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "Y1")
 					(unit 1)
@@ -7270,7 +7270,7 @@
 			(uuid "b8faaa0c-517b-47c6-98fe-4caeff7efd40")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C5")
 					(unit 1)
@@ -7348,7 +7348,7 @@
 			(uuid "74ca3726-04e6-42c1-a0c0-446979282b14")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR017")
 					(unit 1)
@@ -7432,7 +7432,7 @@
 			(uuid "d9ebe4f9-3c10-4a9f-9b6f-9bcd06edd754")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "U2")
 					(unit 1)
@@ -7509,7 +7509,7 @@
 			(uuid "99ce8a55-e208-4385-a80f-2b68db87d249")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR013")
 					(unit 1)
@@ -7591,7 +7591,7 @@
 			(uuid "4a933b9f-84c3-41bb-a2ac-9f5ad43157a5")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R2")
 					(unit 1)
@@ -7674,7 +7674,7 @@
 			(uuid "c0e46e5b-af40-45ab-8715-c99f6956b4b0")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C2")
 					(unit 1)
@@ -7752,7 +7752,7 @@
 			(uuid "02332ff9-e5b9-48fe-a4d9-1ad8e9d7e5d7")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR011")
 					(unit 1)
@@ -7972,7 +7972,7 @@
 			(uuid "2606a17f-b5ce-4182-815b-0adf2cb281b4")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "U1")
 					(unit 1)
@@ -8050,7 +8050,7 @@
 			(uuid "623c1124-420b-4d8c-87af-1892921309e3")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR015")
 					(unit 1)
@@ -8128,7 +8128,7 @@
 			(uuid "8488e9d2-cbc1-4990-8aa2-57f94166f395")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "#PWR01")
 					(unit 1)
@@ -8210,7 +8210,7 @@
 			(uuid "ce454b6d-d3dc-4f88-b0d7-887a7021b321")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "C4")
 					(unit 1)
@@ -8292,7 +8292,7 @@
 			(uuid "22111dec-f967-4294-8327-cd5f44f7d019")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R6")
 					(unit 1)
@@ -8371,7 +8371,7 @@
 			(uuid "54fef0f3-9ac9-449c-b80a-6af5f040225e")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "J4")
 					(unit 1)
@@ -8453,7 +8453,7 @@
 			(uuid "f4c76bf5-6450-48dc-b90c-d2783a3eceec")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R1")
 					(unit 1)
@@ -8533,7 +8533,7 @@
 			(uuid "895e25e5-c7c5-4d58-bd18-194784c067f3")
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(reference "R17")
 					(unit 1)
@@ -8590,7 +8590,7 @@
 			)
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(page "4")
 				)
@@ -8646,7 +8646,7 @@
 			)
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(page "5")
 				)
@@ -8702,7 +8702,7 @@
 			)
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(page "3")
 				)
@@ -8758,7 +8758,7 @@
 			)
 		)
 		(instances
-			(project "hanging-garden-pcb"
+			(project "kelp-pcb"
 				(path "/f087d67a-4a75-43d5-b0d2-25bfa3aa79ac"
 					(page "2")
 				)
