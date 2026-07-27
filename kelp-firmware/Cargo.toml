@@ -1,0 +1,39 @@
+[package]
+name = "kelp-firmware"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ch32-hal = {
+    git = "https://github.com/ch32-rs/ch32-hal",
+    rev = "71a298580",
+    features = [
+    "ch32v203c8u6",
+    "memory-x",
+    "embassy",
+    "rt",
+    "time-driver-tim2",
+], default-features = false }
+
+
+# This is okay because we should automatically use whatever ch32-hal uses
+qingke-rt = "0.7"
+qingke = "0.7"
+
+panic-halt = "1.0"
+
+embassy-executor = { version = "0.10.0", features = [
+    "platform-spin",
+    "executor-thread",
+] }
+embassy-time = "0.5.1"
+
+[profile.release]
+strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
+lto = true
+opt-level = "z" # Optimize for size.
+
+[profile.dev]
+strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
+lto = true
+opt-level = "z" # Optimize for size.
