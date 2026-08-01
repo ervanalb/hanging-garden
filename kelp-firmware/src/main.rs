@@ -56,6 +56,20 @@ fn encode_byte_to_spi(byte: u8, buffer: &mut [u8], offset: usize) {
     }
 }
 
+#[qingke_rt::entry]
+fn main() -> ! {
+    let p = hal::init(Default::default());
+
+    let mut led =
+        ch32_hal::gpio::Output::new(p.PB5, ch32_hal::gpio::Level::Low, Default::default());
+    loop {
+        led.toggle();
+
+        //qingke::riscv::asm::delay(1000000);
+    }
+}
+
+/*
 #[embassy_executor::main(entry = "ch32_hal::entry")]
 async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let p = hal::init(Default::default());
@@ -80,3 +94,4 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         Timer::after_millis(500).await;
     }
 }
+*/

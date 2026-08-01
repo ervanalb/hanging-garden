@@ -455,18 +455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hanging-garden-firmware"
-version = "0.1.0"
-dependencies = [
- "ch32-hal",
- "embassy-executor",
- "embassy-time",
- "panic-halt",
- "qingke",
- "qingke-rt",
-]
-
-[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -490,6 +478,18 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "kelp-firmware"
+version = "0.1.0"
+dependencies = [
+ "ch32-hal",
+ "embassy-executor",
+ "embassy-time",
+ "panic-halt",
+ "qingke",
+ "qingke-rt",
+]
 
 [[package]]
 name = "lazy_static"
@@ -636,8 +636,6 @@ dependencies = [
 [[package]]
 name = "qingke"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6e6adbd788587b2f0893d36ef8dd1eb9e7f9b7a32678e9b43149df1880575a"
 dependencies = [
  "bit_field",
  "cfg-if",
@@ -648,8 +646,6 @@ dependencies = [
 [[package]]
 name = "qingke-rt"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3f5debfcb74752c0949a1f2700e5c98a34ae06174b6551034d99de0d12f13c"
 dependencies = [
  "qingke",
  "qingke-rt-macros",
@@ -658,8 +654,6 @@ dependencies = [
 [[package]]
 name = "qingke-rt-macros"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e26f9a1d7490c8c7e75ef095511c8b146a2958f27e4e3e9d3ce2411d948f07ff"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
