@@ -1,5 +1,6 @@
 mod visualizer;
 
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::mpsc;
@@ -184,12 +185,140 @@ where
     (network, handles)
 }
 
-async fn random_delay_test(node: Node) {
-    let node_name = {
-        let network = node.network.borrow();
-        network.nodes[node.node_id].name.clone()
-    };
+#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
+struct CommState {
+    seq_num: u32,
+    type_: CommStateType,
+}
 
+impl CommState {
+    fn is_consistent(&self, other: &Self) -> bool {
+        self.seq_num == other.seq_num && self.type_.is_consistent(&other.type_)
+    }
+
+    /// Serialize CommState to bytes with CRC checksum and COBS framing
+    /// Returns a Vec<u8> containing the COBS-encoded frame
+    fn serialize(&self) -> Result<Vec<u8>, postcard::Error> {
+        // 1. Serialize to bytes using postcard
+        let serialized = postcard::to_allocvec(self)?;
+
+        // 2. Calculate CRC32 checksum
+        let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+        let checksum = crc.checksum(&serialized);
+
+        // 3. Append checksum to serialized data
+        let mut data_with_crc = serialized;
+        data_with_crc.extend_from_slice(&checksum.to_le_bytes());
+
+        // 4. COBS encode the data
+        // COBS encoding adds 1 byte overhead plus potential padding
+        let mut encoded =
+            vec![0u8; data_with_crc.len() + cobs::max_encoding_length(data_with_crc.len())];
+        let encoded_len = cobs::encode(&data_with_crc, &mut encoded);
+        encoded.truncate(encoded_len);
+
+        // Add delimiter (0x00) at the end
+        encoded.push(0x00);
+
+        Ok(encoded)
+    }
+
+    /// Deserialize CommState from COBS-framed bytes with CRC verification
+    /// The input should include the COBS encoding and trailing delimiter
+    fn deserialize(encoded: &[u8]) -> Result<Self, DeserializeError> {
+        // 1. Remove trailing delimiter if present
+        let encoded = if encoded.last() == Some(&0x00) {
+            &encoded[..encoded.len() - 1]
+        } else {
+            encoded
+        };
+
+        // 2. COBS decode
+        let mut decoded = vec![0u8; encoded.len()];
+        let decoded_len =
+            cobs::decode(encoded, &mut decoded).map_err(|_| DeserializeError::CobsDecoding)?;
+        decoded.truncate(decoded_len);
+
+        // 3. Extract and verify CRC checksum
+        if decoded.len() < 4 {
+            return Err(DeserializeError::TooShort);
+        }
+
+        let (data, crc_bytes) = decoded.split_at(decoded.len() - 4);
+        let received_crc =
+            u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+
+        let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+        let computed_crc = crc.checksum(data);
+
+        if received_crc != computed_crc {
+            return Err(DeserializeError::CrcMismatch {
+                expected: computed_crc,
+                received: received_crc,
+            });
+        }
+
+        // 4. Deserialize with postcard
+        let state = postcard::from_bytes(data).map_err(DeserializeError::Postcard)?;
+
+        Ok(state)
+    }
+
+    fn propagate(&self) -> [Self; 4] {
+        self.type_.propagate().map(|type_| Self {
+            seq_num: self.seq_num,
+            type_,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum DeserializeError {
+    CobsDecoding,
+    TooShort,
+    CrcMismatch { expected: u32, received: u32 },
+    Postcard(postcard::Error),
+}
+
+impl std::fmt::Display for DeserializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeserializeError::CobsDecoding => write!(f, "COBS decoding failed"),
+            DeserializeError::TooShort => write!(f, "Data too short to contain CRC"),
+            DeserializeError::CrcMismatch { expected, received } => {
+                write!(
+                    f,
+                    "CRC mismatch: expected {:#x}, received {:#x}",
+                    expected, received
+                )
+            }
+            DeserializeError::Postcard(e) => write!(f, "Postcard deserialization error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for DeserializeError {}
+
+#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Clone)]
+pub enum CommStateType {
+    Nop,
+}
+
+impl CommStateType {
+    fn is_consistent(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CommStateType::Nop, CommStateType::Nop) => true,
+            //_ => false,
+        }
+    }
+    fn propagate(&self) -> [Self; 4] {
+        match self {
+            CommStateType::Nop => std::array::from_fn(|_| CommStateType::Nop),
+        }
+    }
+}
+
+async fn node_protocol(node: Node) {
     loop {
         let t = rand::random_range(0.5..1.0);
         tokio::time::sleep(tokio::time::Duration::from_secs_f64(t)).await;
@@ -377,7 +506,7 @@ fn main() {
         .build()
         .unwrap();
 
-    let (network, grid) = create_grid("grid", grid_rows, grid_cols, random_delay_test);
+    let (network, grid) = create_grid("grid", grid_rows, grid_cols, node_protocol);
 
     // Spawn the root task
     rt.block_on(async {
