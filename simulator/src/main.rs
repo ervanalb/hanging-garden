@@ -1,3 +1,5 @@
+mod visualizer;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::mpsc;
@@ -21,27 +23,27 @@ impl Drop for TransmissionGuard {
     }
 }
 
-struct Channel {
+pub struct Channel {
     name: String,
     receivers: Vec<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
-struct ChannelState {
-    counter: usize,
-    conflict: bool,
+pub struct ChannelState {
+    pub counter: usize,
+    pub conflict: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
 #[derive(Clone, Debug)]
-struct NodeState {
-    colors: Vec<Color>,
+pub struct NodeState {
+    pub colors: Vec<Color>,
 }
 
 impl NodeState {
@@ -53,18 +55,19 @@ impl NodeState {
 }
 
 #[derive(Clone, Debug)]
-struct NetworkSnapshot {
-    timestamp: tokio::time::Instant,
-    channels: Vec<ChannelState>,
-    nodes: Vec<NodeState>,
+pub struct NetworkSnapshot {
+    pub timestamp: tokio::time::Instant,
+    pub channels: Vec<ChannelState>,
+    pub nodes: Vec<NodeState>,
 }
 
-struct NodeInfo {
-    name: String,
-    north: Option<ChannelId>,
-    south: Option<ChannelId>,
-    east: Option<ChannelId>,
-    west: Option<ChannelId>,
+#[derive(Clone)]
+pub struct NodeInfo {
+    pub name: String,
+    pub north: Option<ChannelId>,
+    pub south: Option<ChannelId>,
+    pub east: Option<ChannelId>,
+    pub west: Option<ChannelId>,
 }
 
 struct Node {
@@ -175,6 +178,9 @@ where
         }
     }
 
+    // Initialize state after topology is complete
+    network.borrow_mut().initialize_state();
+
     (network, handles)
 }
 
@@ -187,17 +193,12 @@ async fn random_delay_test(node: Node) {
     loop {
         let t = rand::random_range(0.5..1.0);
         tokio::time::sleep(tokio::time::Duration::from_secs_f64(t)).await;
-        println!(
-            "Node {} fired at time {:?}",
-            node_name,
-            tokio::time::Instant::now()
-        );
         node.send_all(vec![0; 1024]).await;
     }
 }
 
-struct Network {
-    nodes: Vec<NodeInfo>,
+pub struct Network {
+    pub nodes: Vec<NodeInfo>,
     channels: Vec<Channel>,
     history: Vec<NetworkSnapshot>,
 }
@@ -207,11 +208,7 @@ impl Network {
         Self {
             nodes: Vec::new(),
             channels: Vec::new(),
-            history: vec![NetworkSnapshot {
-                timestamp: tokio::time::Instant::now(),
-                channels: Vec::new(),
-                nodes: Vec::new(),
-            }],
+            history: Vec::new(),
         }
     }
 
@@ -221,6 +218,22 @@ impl Network {
 
     fn current_node_state(&self) -> &[NodeState] {
         &self.history.last().unwrap().nodes
+    }
+
+    fn initialize_state(&mut self) {
+        // Create initial snapshot with all nodes and channels in default state
+        let initial_snapshot = NetworkSnapshot {
+            timestamp: tokio::time::Instant::now(),
+            channels: vec![
+                ChannelState {
+                    counter: 0,
+                    conflict: false,
+                };
+                self.channels.len()
+            ],
+            nodes: vec![NodeState::new(); self.nodes.len()],
+        };
+        self.history.push(initial_snapshot);
     }
 
     fn mutate<F>(&mut self, f: F)
@@ -253,11 +266,11 @@ impl Network {
         self.mutate(|_channels, nodes| f(nodes));
     }
 
-    fn get_history(&self) -> &[NetworkSnapshot] {
+    pub fn get_history(&self) -> &[NetworkSnapshot] {
         &self.history
     }
 
-    fn history_size(&self) -> usize {
+    pub fn history_size(&self) -> usize {
         self.history.len()
     }
 
@@ -266,13 +279,6 @@ impl Network {
         self.channels.push(Channel {
             name,
             receivers: Vec::new(),
-        });
-        // Add new channel state to current snapshot
-        self.mutate_channels(|channels| {
-            channels.push(ChannelState {
-                counter: 0,
-                conflict: false,
-            });
         });
         id
     }
@@ -292,10 +298,6 @@ impl Network {
             south,
             east,
             west,
-        });
-        // Add new node state to current snapshot
-        self.mutate_nodes(|nodes| {
-            nodes.push(NodeState::new());
         });
         id
     }
@@ -357,7 +359,7 @@ impl Network {
                 let _ = tx.send(message.clone());
             }
         } else {
-            println!("Message was lost in collision");
+            // Message was lost in collision
         }
 
         // Counter decrement and conflict clear happens in Drop
@@ -365,6 +367,9 @@ impl Network {
 }
 
 fn main() {
+    let grid_rows = 10;
+    let grid_cols = 10;
+
     // Create the runtime
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -372,7 +377,7 @@ fn main() {
         .build()
         .unwrap();
 
-    let (network, grid) = create_grid("grid", 10, 10, random_delay_test);
+    let (network, grid) = create_grid("grid", grid_rows, grid_cols, random_delay_test);
 
     // Spawn the root task
     rt.block_on(async {
@@ -406,5 +411,24 @@ fn main() {
                 );
             }
         }
+    }
+
+    // Launch visualizer (check for --no-viz flag)
+    let args: Vec<String> = std::env::args().collect();
+    if !args.contains(&"--no-viz".to_string()) {
+        println!("\nLaunching visualizer...");
+        println!("(Use --no-viz flag to skip visualization)");
+        let visualizer_data = visualizer::VisualizerData {
+            snapshots: net.get_history().to_vec(),
+            nodes: net.nodes.clone(),
+            grid_rows,
+            grid_cols,
+        };
+        drop(net); // Release the borrow
+
+        let vis = visualizer::Visualizer::new(visualizer_data);
+        vis.run();
+    } else {
+        println!("\nSkipping visualization (--no-viz flag set)");
     }
 }
