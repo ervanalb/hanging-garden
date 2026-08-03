@@ -15,7 +15,9 @@ struct TransmissionGuard {
 
 impl Drop for TransmissionGuard {
     fn drop(&mut self) {
-        self.network.borrow_mut().decrement_channel_counter(self.channel_id);
+        self.network
+            .borrow_mut()
+            .decrement_channel_counter(self.channel_id);
     }
 }
 
@@ -30,10 +32,31 @@ struct ChannelState {
     conflict: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Clone, Debug)]
+struct NodeState {
+    colors: Vec<Color>,
+}
+
+impl NodeState {
+    fn new() -> Self {
+        Self {
+            colors: vec![Color { r: 0, g: 0, b: 0 }; 100],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NetworkSnapshot {
     timestamp: tokio::time::Instant,
     channels: Vec<ChannelState>,
+    nodes: Vec<NodeState>,
 }
 
 struct NodeInfo {
@@ -54,28 +77,32 @@ impl Node {
         let channel_ids: Vec<ChannelId> = {
             let network = self.network.borrow();
             let node_info = &network.nodes[self.node_id];
-            [node_info.north, node_info.south, node_info.east, node_info.west]
-                .into_iter()
-                .filter_map(|ch| ch)
-                .collect()
+            [
+                node_info.north,
+                node_info.south,
+                node_info.east,
+                node_info.west,
+            ]
+            .into_iter()
+            .filter_map(|ch| ch)
+            .collect()
         };
 
-        futures::future::join_all(
-            channel_ids
-                .into_iter()
-                .map(|channel_id| {
-                    let network = self.network.clone();
-                    let msg = message.clone();
-                    async move {
-                        Network::send_on_channel(network, channel_id, msg).await
-                    }
-                }),
-        )
+        futures::future::join_all(channel_ids.into_iter().map(|channel_id| {
+            let network = self.network.clone();
+            let msg = message.clone();
+            async move { Network::send_on_channel(network, channel_id, msg).await }
+        }))
         .await;
     }
 }
 
-fn create_grid<F, Fut>(name: &str, rows: usize, cols: usize, protocol: F) -> (Rc<RefCell<Network>>, Vec<Fut>)
+fn create_grid<F, Fut>(
+    name: &str,
+    rows: usize,
+    cols: usize,
+    protocol: F,
+) -> (Rc<RefCell<Network>>, Vec<Fut>)
 where
     F: Fn(Node) -> Fut + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
@@ -135,7 +162,9 @@ where
             };
 
             let node_name = format!("{name} r{row} c{col}");
-            let node_id = network.borrow_mut().add_node(node_name, north, south, east, west);
+            let node_id = network
+                .borrow_mut()
+                .add_node(node_name, north, south, east, west);
 
             let node = Node {
                 network: network.clone(),
@@ -181,25 +210,47 @@ impl Network {
             history: vec![NetworkSnapshot {
                 timestamp: tokio::time::Instant::now(),
                 channels: Vec::new(),
+                nodes: Vec::new(),
             }],
         }
     }
 
-    fn current_state(&self) -> &[ChannelState] {
+    fn current_channel_state(&self) -> &[ChannelState] {
         &self.history.last().unwrap().channels
     }
 
-    fn mutate_state<F>(&mut self, f: F)
+    fn current_node_state(&self) -> &[NodeState] {
+        &self.history.last().unwrap().nodes
+    }
+
+    fn mutate<F>(&mut self, f: F)
     where
-        F: FnOnce(&mut Vec<ChannelState>),
+        F: FnOnce(&mut Vec<ChannelState>, &mut Vec<NodeState>),
     {
-        let mut new_channels = self.history.last().unwrap().channels.clone();
-        f(&mut new_channels);
+        let last = self.history.last().unwrap();
+        let mut new_channels = last.channels.clone();
+        let mut new_nodes = last.nodes.clone();
+        f(&mut new_channels, &mut new_nodes);
         let snapshot = NetworkSnapshot {
             timestamp: tokio::time::Instant::now(),
             channels: new_channels,
+            nodes: new_nodes,
         };
         self.history.push(snapshot);
+    }
+
+    fn mutate_channels<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Vec<ChannelState>),
+    {
+        self.mutate(|channels, _nodes| f(channels));
+    }
+
+    fn mutate_nodes<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Vec<NodeState>),
+    {
+        self.mutate(|_channels, nodes| f(nodes));
     }
 
     fn get_history(&self) -> &[NetworkSnapshot] {
@@ -217,7 +268,7 @@ impl Network {
             receivers: Vec::new(),
         });
         // Add new channel state to current snapshot
-        self.mutate_state(|channels| {
+        self.mutate_channels(|channels| {
             channels.push(ChannelState {
                 counter: 0,
                 conflict: false,
@@ -226,7 +277,14 @@ impl Network {
         id
     }
 
-    fn add_node(&mut self, name: String, north: Option<ChannelId>, south: Option<ChannelId>, east: Option<ChannelId>, west: Option<ChannelId>) -> NodeId {
+    fn add_node(
+        &mut self,
+        name: String,
+        north: Option<ChannelId>,
+        south: Option<ChannelId>,
+        east: Option<ChannelId>,
+        west: Option<ChannelId>,
+    ) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(NodeInfo {
             name,
@@ -234,6 +292,10 @@ impl Network {
             south,
             east,
             west,
+        });
+        // Add new node state to current snapshot
+        self.mutate_nodes(|nodes| {
+            nodes.push(NodeState::new());
         });
         id
     }
@@ -245,7 +307,7 @@ impl Network {
     }
 
     fn decrement_channel_counter(&mut self, channel_id: ChannelId) {
-        self.mutate_state(|channels| {
+        self.mutate_channels(|channels| {
             let state = &mut channels[channel_id];
             state.counter -= 1;
             if state.counter == 0 {
@@ -254,13 +316,17 @@ impl Network {
         });
     }
 
-    async fn send_on_channel(network: Rc<RefCell<Network>>, channel_id: ChannelId, message: Vec<u8>) {
+    async fn send_on_channel(
+        network: Rc<RefCell<Network>>,
+        channel_id: ChannelId,
+        message: Vec<u8>,
+    ) {
         let message_time = Duration::from_secs_f64(message.len() as f64 / BYTES_PER_SECOND);
 
         // If counter >= 1, set conflict flag, then increment counter
         {
             let mut net = network.borrow_mut();
-            net.mutate_state(|channels| {
+            net.mutate_channels(|channels| {
                 let state = &mut channels[channel_id];
                 if state.counter >= 1 {
                     state.conflict = true;
@@ -281,7 +347,7 @@ impl Network {
         // If conflict flag is clear, deliver message
         let should_deliver = {
             let net = network.borrow();
-            !net.current_state()[channel_id].conflict
+            !net.current_channel_state()[channel_id].conflict
         };
 
         if should_deliver {
@@ -324,14 +390,20 @@ fn main() {
 
     if let Some(first) = net.get_history().first() {
         println!("First snapshot at: {:?}", first.timestamp);
+        println!("Nodes in first snapshot: {}", first.nodes.len());
     }
 
     if let Some(last) = net.get_history().last() {
         println!("Last snapshot at: {:?}", last.timestamp);
+        println!("Nodes in last snapshot: {}", last.nodes.len());
+
         println!("\nLast snapshot channel states:");
         for (i, ch) in last.channels.iter().enumerate() {
             if ch.counter > 0 || ch.conflict {
-                println!("  Channel {}: counter={}, conflict={}", i, ch.counter, ch.conflict);
+                println!(
+                    "  Channel {}: counter={}, conflict={}",
+                    i, ch.counter, ch.conflict
+                );
             }
         }
     }
