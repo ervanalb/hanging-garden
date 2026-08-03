@@ -21,14 +21,16 @@ impl Drop for TransmissionGuard {
 
 #[derive(Clone)]
 struct Channel {
+    name: String,
     counter: Rc<RefCell<usize>>,
     conflict: Rc<RefCell<bool>>,
     receivers: Rc<RefCell<Vec<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl Channel {
-    fn new() -> Self {
+    fn new(name: String) -> Self {
         Self {
+            name,
             counter: Rc::new(RefCell::new(0)),
             conflict: Rc::new(RefCell::new(false)),
             receivers: Rc::new(RefCell::new(Vec::new())),
@@ -76,14 +78,7 @@ impl Channel {
     }
 }
 
-struct NodeChannels {
-    north: Option<Channel>,
-    south: Option<Channel>,
-    east: Option<Channel>,
-    west: Option<Channel>,
-}
-
-impl NodeChannels {
+impl Node {
     async fn send_all(&self, message: Vec<u8>) {
         futures::future::join_all(
             [&self.north, &self.south, &self.east, &self.west]
@@ -97,25 +92,27 @@ impl NodeChannels {
 
 fn create_grid<F, Fut>(name: &str, rows: usize, cols: usize, protocol: F) -> Vec<Fut>
 where
-    F: Fn(String, NodeChannels) -> Fut + 'static,
+    F: Fn(Node) -> Fut + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
     // Create vertical channels (north-south connections)
     let mut vertical_channels = Vec::new();
-    for _ in 0..rows - 1 {
+    for r in 0..rows - 1 {
         let mut row_channels = Vec::new();
-        for _ in 0..cols {
-            row_channels.push(Channel::new());
+        for c in 0..cols {
+            let name = format!("{} r{}-{} c{}", name, r, r + 1, c);
+            row_channels.push(Channel::new(name));
         }
         vertical_channels.push(row_channels);
     }
 
     // Create horizontal channels (east-west connections)
     let mut horizontal_channels = Vec::new();
-    for _ in 0..rows {
+    for r in 0..rows {
         let mut row_channels = Vec::new();
-        for _ in 0..cols - 1 {
-            row_channels.push(Channel::new());
+        for c in 0..cols - 1 {
+            let name = format!("{} r{} c{}-{}", name, r, c, c + 1);
+            row_channels.push(Channel::new(name));
         }
         horizontal_channels.push(row_channels);
     }
@@ -148,13 +145,15 @@ where
                 None
             };
 
-            let channels = NodeChannels {
+            let name = format!("{name} r{row} c{col}");
+            let node = Node {
+                name,
                 north,
                 south,
                 east,
                 west,
             };
-            let handle = protocol(format!("{name} r{row} c{col}"), channels);
+            let handle = protocol(node);
             handles.push(handle);
         }
     }
@@ -162,17 +161,30 @@ where
     handles
 }
 
-async fn random_delay_test(name: String, channels: NodeChannels) {
+struct Node {
+    name: String,
+    north: Option<Channel>,
+    south: Option<Channel>,
+    east: Option<Channel>,
+    west: Option<Channel>,
+}
+
+async fn random_delay_test(node: Node) {
     loop {
         let t = rand::random_range(0.5..1.0);
         tokio::time::sleep(tokio::time::Duration::from_secs_f64(t)).await;
         println!(
             "Node {} fired at time {:?}",
-            name,
+            node.name,
             tokio::time::Instant::now()
         );
-        channels.send_all(vec![0; 1024]).await;
+        node.send_all(vec![0; 1024]).await;
     }
+}
+
+struct Network {
+    nodes: Vec<Node>,
+    channels: Vec<Channel>,
 }
 
 fn main() {
