@@ -99,6 +99,29 @@ impl Node {
         }))
         .await;
     }
+
+    async fn send_directional(&self, messages: [Vec<u8>; 4]) {
+        let channel_ids = {
+            let network = self.network.borrow();
+            let node_info = &network.nodes[self.node_id];
+            [
+                node_info.north,
+                node_info.south,
+                node_info.east,
+                node_info.west,
+            ]
+        };
+
+        futures::future::join_all(channel_ids.into_iter().zip(messages).filter_map(
+            |(channel_id, msg)| {
+                channel_id.map(|ch_id| {
+                    let network = self.network.clone();
+                    async move { Network::send_on_channel(network, ch_id, msg).await }
+                })
+            },
+        ))
+        .await;
+    }
 }
 
 fn create_grid<F, Fut>(
@@ -319,10 +342,172 @@ impl CommStateType {
 }
 
 async fn node_protocol(node: Node) {
-    loop {
-        let t = rand::random_range(0.5..1.0);
-        tokio::time::sleep(tokio::time::Duration::from_secs_f64(t)).await;
-        node.send_all(vec![0; 1024]).await;
+    // Trickle algorithm constants
+    const IMIN: f64 = 0.01; // 10ms minimum interval
+    const IMAX: f64 = 10.0; // 10 second maximum interval
+    const K: usize = 1; // redundancy constant
+
+    // Create receivers for each direction (north, south, east, west)
+    let (mut north_rx, mut south_rx, mut east_rx, mut west_rx) = {
+        let mut network = node.network.borrow_mut();
+        (
+            network.nodes[node.node_id]
+                .north
+                .map(|ch| network.create_receiver(ch)),
+            network.nodes[node.node_id]
+                .south
+                .map(|ch| network.create_receiver(ch)),
+            network.nodes[node.node_id]
+                .east
+                .map(|ch| network.create_receiver(ch)),
+            network.nodes[node.node_id]
+                .west
+                .map(|ch| network.create_receiver(ch)),
+        )
+    };
+
+    // Initialize node state
+    let mut current_state = CommState {
+        seq_num: 0,
+        type_: CommStateType::Nop,
+    };
+
+    // Trickle algorithm state
+    let mut interval = IMIN;
+
+    // Create a channel for node-generated events
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CommState>();
+
+    // Spawn a task to generate events periodically
+    {
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let new_state = CommState {
+                    seq_num: rand::random(),
+                    type_: CommStateType::Nop,
+                };
+                let _ = event_tx.send(new_state);
+            }
+        });
+    }
+
+    'interval_loop: loop {
+        // 1. Start of interval
+        let mut counter = 0;
+        let t = rand::random_range(interval / 2.0..interval);
+
+        // Macro to handle message/event with timeout
+        macro_rules! wait_for_event_or_timeout {
+            ($deadline:expr) => {{
+                let mut should_reset = false;
+                loop {
+                    let remaining =
+                        $deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+
+                    let result = tokio::time::timeout(remaining, async {
+                        tokio::select! {
+                            Some(msg) = async {
+                                tokio::select! {
+                                    Some(msg) = async {
+                                        match &mut north_rx {
+                                            Some(rx) => rx.recv().await,
+                                            None => futures::future::pending().await,
+                                        }
+                                    } => Some(msg),
+                                    Some(msg) = async {
+                                        match &mut south_rx {
+                                            Some(rx) => rx.recv().await,
+                                            None => futures::future::pending().await,
+                                        }
+                                    } => Some(msg),
+                                    Some(msg) = async {
+                                        match &mut east_rx {
+                                            Some(rx) => rx.recv().await,
+                                            None => futures::future::pending().await,
+                                        }
+                                    } => Some(msg),
+                                    Some(msg) = async {
+                                        match &mut west_rx {
+                                            Some(rx) => rx.recv().await,
+                                            None => futures::future::pending().await,
+                                        }
+                                    } => Some(msg),
+                                }
+                            } => {
+                                // Handle incoming message
+                                match CommState::deserialize(&msg) {
+                                    Ok(received_state) => {
+                                        if received_state > current_state {
+                                            // Received message takes precedence
+                                            current_state = received_state;
+                                            interval = IMIN;
+                                            Some(true)
+                                        } else if received_state < current_state {
+                                            if !current_state.is_consistent(&received_state) {
+                                                // Received message is outdated
+                                                interval = IMIN;
+                                                Some(true)
+                                            } else {
+                                                // Received message is consistent
+                                                Some(false)
+                                            }
+                                        } else {
+                                            counter += 1;
+                                            Some(false)
+                                        }
+                                    }
+                                    Err(_) => Some(false),
+                                }
+                            }
+                            Some(new_state) = event_rx.recv() => {
+                                current_state = new_state;
+                                interval = IMIN;
+                                Some(true)
+                            }
+                        }
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Some(true)) => {
+                            should_reset = true;
+                            break;
+                        }
+                        Ok(Some(false)) | Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+                should_reset
+            }};
+        }
+
+        // 2. Wait for timer t expiry (possibly interrupted by msg recv or event)
+        let t_deadline = tokio::time::Instant::now() + Duration::from_secs_f64(t);
+        if wait_for_event_or_timeout!(t_deadline) {
+            continue 'interval_loop;
+        }
+
+        // 3. Handle timer t expiry
+        if counter < K {
+            let states = current_state.propagate();
+            let messages: [Vec<u8>; 4] =
+                states.map(|state| state.serialize().unwrap_or_else(|_| vec![]));
+            node.send_directional(messages).await;
+        }
+
+        // 4. Wait for interval expiry (possibly interrupted by msg recv or event)
+        let interval_deadline = tokio::time::Instant::now() + Duration::from_secs_f64(interval - t);
+        if wait_for_event_or_timeout!(interval_deadline) {
+            continue 'interval_loop;
+        }
+
+        // 5. Handle interval expiry - double interval and loop
+        interval = (interval * 2.0).min(IMAX);
     }
 }
 
