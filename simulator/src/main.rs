@@ -45,12 +45,17 @@ pub struct Color {
 #[derive(Clone, Debug)]
 pub struct NodeState {
     pub colors: Vec<Color>,
+    pub comm_state: CommState,
 }
 
 impl NodeState {
     fn new() -> Self {
         Self {
             colors: vec![Color { r: 0, g: 0, b: 0 }; 100],
+            comm_state: CommState {
+                seq_num: 0,
+                type_: CommStateType::Nop,
+            },
         }
     }
 }
@@ -208,10 +213,10 @@ where
     (network, handles)
 }
 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
-struct CommState {
-    seq_num: u32,
-    type_: CommStateType,
+#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Clone, Debug)]
+pub struct CommState {
+    pub seq_num: u32,
+    pub type_: CommStateType,
 }
 
 impl CommState {
@@ -322,7 +327,7 @@ impl std::fmt::Display for DeserializeError {
 
 impl std::error::Error for DeserializeError {}
 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Clone)]
+#[derive(PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Clone, Debug)]
 pub enum CommStateType {
     Nop,
 }
@@ -341,7 +346,7 @@ impl CommStateType {
     }
 }
 
-async fn node_protocol(node: Node) {
+async fn trickle_protocol(node: Node, mut event_rx: mpsc::UnboundedReceiver<CommState>) {
     // Trickle algorithm constants
     const IMIN: f64 = 0.01; // 10ms minimum interval
     const IMAX: f64 = 10.0; // 10 second maximum interval
@@ -366,37 +371,27 @@ async fn node_protocol(node: Node) {
         )
     };
 
-    // Initialize node state
-    let mut current_state = CommState {
-        seq_num: 0,
-        type_: CommStateType::Nop,
-    };
-
     // Trickle algorithm state
     let mut interval = IMIN;
-
-    // Create a channel for node-generated events
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CommState>();
-
-    // Spawn a task to generate events periodically
-    {
-        let event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                let new_state = CommState {
-                    seq_num: rand::random(),
-                    type_: CommStateType::Nop,
-                };
-                let _ = event_tx.send(new_state);
-            }
-        });
-    }
 
     'interval_loop: loop {
         // 1. Start of interval
         let mut counter = 0;
         let t = rand::random_range(interval / 2.0..interval);
+
+        // Read current state from network
+        let mut current_state = node.network.borrow().current_node_state()[node.node_id]
+            .comm_state
+            .clone();
+
+        // Helper to update state in both local variable and network
+        let update_state = |new_state: CommState| {
+            let node_id = node.node_id;
+            node.network
+                .borrow_mut()
+                .mutate_nodes(|nodes| nodes[node_id].comm_state = new_state.clone());
+            new_state
+        };
 
         // Macro to handle message/event with timeout
         macro_rules! wait_for_event_or_timeout {
@@ -444,7 +439,7 @@ async fn node_protocol(node: Node) {
                                     Ok(received_state) => {
                                         if received_state > current_state {
                                             // Received message takes precedence
-                                            current_state = received_state;
+                                            current_state = update_state(received_state);
                                             interval = IMIN;
                                             Some(true)
                                         } else if received_state < current_state {
@@ -465,7 +460,7 @@ async fn node_protocol(node: Node) {
                                 }
                             }
                             Some(new_state) = event_rx.recv() => {
-                                current_state = new_state;
+                                current_state = update_state(new_state);
                                 interval = IMIN;
                                 Some(true)
                             }
@@ -509,6 +504,32 @@ async fn node_protocol(node: Node) {
         // 5. Handle interval expiry - double interval and loop
         interval = (interval * 2.0).min(IMAX);
     }
+}
+
+async fn node_protocol(node: Node) {
+    // Create a channel for node-generated events
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<CommState>();
+
+    // Clone network and node_id for event generator
+    let network = node.network.clone();
+    let node_id = node.node_id;
+
+    // Spawn a task to generate events periodically
+    tokio::select! {
+        () = async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let net = network.borrow();
+                let seq_num = net.current_node_state()[node_id].comm_state.seq_num;
+                let new_state = CommState {
+                    seq_num: seq_num + 1,
+                    type_: CommStateType::Nop,
+                };
+                let _ = event_tx.send(new_state);
+            }
+        } => {}
+        () = trickle_protocol(node, event_rx) => {}
+    };
 }
 
 pub struct Network {
