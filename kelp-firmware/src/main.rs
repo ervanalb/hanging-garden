@@ -1,465 +1,219 @@
 #![no_std]
 #![no_main]
 
-use ch32_hal as hal;
-use embassy_time::Timer;
-use hal::adc::{ADC_MAX, Pga, SampleTime, VREF_INT, VrefInt};
-use hal::touchkey::{ChargeTime, TouchKey};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+
+use ch32_metapac as pac;
+use pac::gpio::vals::{Cnf, Mode};
+use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
+use pac::spi::vals::BaudRate;
 use panic_halt as _;
 
-const TOUCHKEY_DISCHARGE_TIME: u8 = 0x08;
+// Ring buffer configuration
+const RING_BUFFER_SIZE: usize = 256;
 
-const LED_COUNT: usize = 50;
-
-// Update all 5 LEDs with the same color
-// Sends entire message at once with proper reset code
-async fn ws2812_update(
-    spi: &mut hal::spi::Spi<'_, hal::peripherals::SPI1, hal::mode::Async>,
-    r: u8,
-    g: u8,
-    b: u8,
-) {
-    // Buffer: 5 LEDs × 3 bytes/LED × 4 SPI bytes per data byte = 60 bytes
-    // Reset: 300µs at 4MHz = 1200 bits = 150 bytes of 0x00
-    const DATA_BYTES: usize = LED_COUNT * 3 * 4; // 60 bytes
-    const RESET_BYTES: usize = 150;
-    const TOTAL_BYTES: usize = DATA_BYTES + RESET_BYTES; // 210
-
-    let mut buffer = [0u8; TOTAL_BYTES];
-
-    // Encode color data for all 5 LEDs (WS2812 uses GRB order)
-    for led in 0..LED_COUNT {
-        let led_offset = led * 3 * 4; // Each LED = 3 color bytes × 4 SPI bytes per color byte
-        encode_byte_to_spi(g, &mut buffer, led_offset);
-        encode_byte_to_spi(r, &mut buffer, led_offset + 4);
-        encode_byte_to_spi(b, &mut buffer, led_offset + 8);
-    }
-
-    // Reset code: remaining bytes already initialized to 0x00
-    // This provides 150 bytes × 8 bits/byte × 0.25µs/bit = 300µs of low signal
-
-    // Send entire message at once
-    spi.write(&buffer).await.ok();
+/// Lock-free SPSC (Single Producer Single Consumer) ring buffer
+/// Producer (main thread) writes to head, Consumer (interrupt) reads from tail
+struct RingBuffer {
+    buffer: [u16; RING_BUFFER_SIZE],
+    head: AtomicUsize,  // Modified only by producer
+    tail: AtomicUsize,  // Modified only by consumer
 }
 
-// Encode a single byte into WS2812 SPI format
-// WS2812 protocol: 0 bit = ~400ns high + ~850ns low, 1 bit = ~800ns high + ~450ns low
-// At 4 MHz SPI (250ns per bit), we encode using 4 SPI bits per WS2812 bit:
-// '0' as 0b1000 (1 high, 3 low = 250ns high, 750ns low)
-// '1' as 0b1110 (3 high, 1 low = 750ns high, 250ns low)
-// Each data byte (8 bits) becomes 32 SPI bits = 4 bytes (2 WS2812 bits per SPI byte)
-fn encode_byte_to_spi(byte: u8, buffer: &mut [u8], offset: usize) {
-    // Process 2 WS2812 bits at a time (fits in 1 SPI byte = 8 bits)
-    for i in 0..4 {
-        let bit_pair_index = i * 2;
-        let bit0 = (byte >> (7 - bit_pair_index)) & 1;
-        let bit1 = (byte >> (6 - bit_pair_index)) & 1;
-
-        let pattern0 = if bit0 == 1 { 0b1110 } else { 0b1000 };
-        let pattern1 = if bit1 == 1 { 0b1110 } else { 0b1000 };
-
-        buffer[offset + i] = (pattern0 << 4) | pattern1;
+impl RingBuffer {
+    const fn new() -> Self {
+        Self {
+            buffer: [0; RING_BUFFER_SIZE],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
     }
-}
 
-/*
-#[embassy_executor::main(entry = "ch32_hal::entry")]
-async fn main(_spawner: embassy_executor::Spawner) -> ! {
-    let p = hal::init(Default::default());
+    /// Push a value (called only from main thread - single producer)
+    fn push(&self, value: u16) -> Result<(), ()> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire); // Acquire to sync with consumer
+        let next_head = (head + 1) % RING_BUFFER_SIZE;
 
-    hal::debug::SDIPrint::enable();
-
-    // Configure ADC1 for regular ADC readings
-    let mut adc = hal::adc::Adc::new(p.ADC1, Default::default());
-    let mut pa6 = p.PA6;
-    let mut pa7 = p.PA7;
-    let mut vrefint = VrefInt;
-
-    // Configure ADC2 for touchkey
-    let mut touchkey = TouchKey::new(p.ADC2, Default::default());
-    let mut pa1 = p.PA1;
-
-    // Touchkey baseline
-    let mut touchkey_baseline: Option<u16> = None;
-
-    // PB3 = LED power enable (active low)
-    let _led_enable =
-        hal::gpio::OutputOpenDrain::new(p.PB3, hal::gpio::Level::Low, Default::default());
-
-    // Configure SPI1 for WS2812 control on PB5 (MOSI)
-    // SPI frequency: aim for ~6.4 MHz for WS2812 timing
-    // With 8 MHz system clock, divider of 2 gives 4 MHz (close enough)
-    let mut spi_config = hal::spi::Config::default();
-    spi_config.frequency = hal::time::Hertz(4_000_000);
-    let mut spi = hal::spi::Spi::new_txonly_nosck(p.SPI1, p.PB5, p.DMA1_CH3, spi_config);
-
-    let mut cnt = 0;
-
-    loop {
-        use hal::println;
-
-        // Read touchkey from PA1
-        let touchkey_value = touchkey.read(&mut pa1, ChargeTime::CYCLES7_5, TOUCHKEY_DISCHARGE_TIME);
-
-        // Establish touchkey baseline on first reading
-        if touchkey_baseline.is_none() {
-            touchkey_baseline = Some(touchkey_value);
+        if next_head == tail {
+            return Err(()); // Buffer full
         }
 
-        // Calculate touchkey difference from baseline
-        let touchkey_diff = if let Some(baseline) = touchkey_baseline {
-            baseline.saturating_sub(touchkey_value)
-        } else {
-            0
+        // SAFETY: Single producer, we have exclusive write access to head position
+        unsafe {
+            let buf_ptr = self.buffer.as_ptr() as *mut u16;
+            buf_ptr.add(head).write(value);
+        }
+
+        // Release store to make data visible to consumer
+        self.head.store(next_head, Ordering::Release);
+        Ok(())
+    }
+
+    /// Pop a value (called only from interrupt - single consumer)
+    fn pop(&self) -> Option<u16> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire); // Acquire to sync with producer
+
+        if head == tail {
+            return None; // Buffer empty
+        }
+
+        // SAFETY: Single consumer, we have exclusive read access to tail position
+        let value = unsafe {
+            let buf_ptr = self.buffer.as_ptr();
+            buf_ptr.add(tail).read()
         };
 
-        // Read internal voltage reference
-        let vref_reading = adc.convert(&mut vrefint, SampleTime::CYCLES239_5, Pga::X1);
+        let next_tail = (tail + 1) % RING_BUFFER_SIZE;
+        // Release store to make space visible to producer
+        self.tail.store(next_tail, Ordering::Release);
 
-        // Calculate actual VDDA in millivolts
-        let vdda_mv = (VREF_INT * ADC_MAX) / vref_reading as u32;
+        Some(value)
+    }
+}
 
-        let pa6_value = adc.convert(&mut pa6, SampleTime::CYCLES239_5, Pga::X1);
-        let pa7_value = adc.convert(&mut pa7, SampleTime::CYCLES239_5, Pga::X1);
+// Global ring buffer
+static TX_BUFFER: RingBuffer = RingBuffer::new();
 
-        // Convert PA6 ADC value to voltage in millivolts
-        let pa6_voltage_mv = (pa6_value as u32 * vdda_mv) / ADC_MAX;
+/// Push data to SPI transmit buffer and start transmission if needed
+///
+/// This is lock-free! We use the peripheral's TXE flag and TXEIE bit as synchronization:
+/// - Enabling TXEIE when TXE is set causes the interrupt to fire
+/// - The interrupt drains the buffer and disables TXEIE when empty
+/// - Next push re-enables TXEIE, restarting the cycle
+pub fn spi_push(data: u16) -> Result<(), ()> {
+    // Add data to buffer (lock-free SPSC)
+    TX_BUFFER.push(data)?;
 
-        // Calculate current through 50mOhm sense resistor
-        // I = V / R, where R = 0.05 Ohm
-        // Current in A = (voltage_mv / 1000) / 0.05 = voltage_mv / 50
-        let current_ma = (pa6_voltage_mv * 1000) / 50; // Current in milliamps
-        let current_a = current_ma / 1000; // Current in amps (integer part)
-        let current_ma_frac = current_ma % 1000; // Fractional part in milliamps
+    // Enable interrupt. If TXE is set (peripheral ready), interrupt fires immediately.
+    // If TXE is clear (transmission in progress), interrupt fires when TXE becomes set.
+    let spi1 = pac::SPI1;
+    spi1.ctlr2().modify(|w| w.set_txeie(true));
 
-        // Convert PA7 ADC value to actual voltage in millivolts
-        let pa7_voltage_mv = (pa7_value as u32 * vdda_mv) / ADC_MAX;
+    Ok(())
+}
 
-        // PA7 reads half of bus voltage, so multiply by 2
-        let bus_voltage_mv = pa7_voltage_mv * 2;
+/// SPI1 interrupt handler
+/// Drains the ring buffer until empty, then disables itself
+#[qingke_rt::interrupt]
+fn SPI1() {
+    let spi1 = pac::SPI1;
 
-        println!(
-            "Touch: {} (diff: {}), VDDA: {} mV, Current: {}.{} A, Bus: {} mV",
-            touchkey_value, touchkey_diff, vdda_mv, current_a, current_ma_frac, bus_voltage_mv
-        );
-
-        Timer::after_millis(50).await;
-
-        if cnt < 10 {
-            ws2812_update(&mut spi, 255, 255, 255).await;
-            cnt += 1;
-        } else if cnt < 20 {
-            ws2812_update(&mut spi, 0, 0, 0).await;
-            cnt += 1;
+    // Check if TXE (transmit buffer empty) flag is set
+    if spi1.statr().read().txe() {
+        // Try to get next word from buffer
+        if let Some(word) = TX_BUFFER.pop() {
+            // More data to send
+            spi1.datar().write(|w| w.set_datar(word));
+            // Interrupt stays enabled, will fire again when TXE becomes set
         } else {
-            cnt = 0;
+            // Buffer empty - disable interrupt until next push
+            spi1.ctlr2().modify(|w| w.set_txeie(false));
         }
     }
 }
-*/
 
-// New USART test main with DMA
-#[embassy_executor::main(entry = "ch32_hal::entry")]
-async fn main(_spawner: embassy_executor::Spawner) -> ! {
-    let p = hal::init(Default::default());
+#[qingke_rt::entry]
+fn main() -> ! {
+    // Configure system clock to 144 MHz from HSI
+    // HSI = 8 MHz, PLL = HSI * 18 = 144 MHz
+    let rcc = pac::RCC;
 
-    hal::debug::SDIPrint::enable();
+    // Enable HSI
+    rcc.ctlr().modify(|w| w.set_hsion(true));
+    while !rcc.ctlr().read().hsirdy() {}
 
-    use hal::println;
-    println!("USART Half-Duplex DMA Test Starting");
+    // Configure main PLL: HSI * 18 = 144 MHz
+    rcc.cfgr0().modify(|w| {
+        w.set_pllsrc(false); // HSI as PLL source
+        w.set_pllmul(PllMul::MUL18); // PLL multiplier x18
+    });
 
-    // Configure all 4 USARTs in async half-duplex mode at 115.2 kbps with DMA
-    let mut config = hal::usart::Config::default();
-    config.baudrate = 115_200;
+    // Configure bus prescalers (all DIV1)
+    rcc.cfgr0().modify(|w| {
+        w.set_hpre(Hpre::DIV1); // AHB prescaler = 1
+        w.set_ppre1(Ppre::DIV1); // APB1 prescaler = 1
+        w.set_ppre2(Ppre::DIV1); // APB2 prescaler = 1
+    });
 
-    // USART1 - South (PA9) with DMA1_CH4 (TX) and DMA1_CH5 (RX)
-    println!("Init USART1 (South) on PA9 with DMA");
-    let south =
-        hal::usart::Uart::new_half_duplex::<0>(p.USART1, p.PA9, p.DMA1_CH4, p.DMA1_CH5, config)
-            .unwrap();
-    let (mut south_tx, mut south_rx) = south.split();
+    // Enable PLL
+    rcc.ctlr().modify(|w| w.set_pllon(true));
+    while !rcc.ctlr().read().pllrdy() {}
 
-    // USART2 - West (PA2) with DMA1_CH7 (TX) and DMA1_CH6 (RX)
-    println!("Init USART2 (West) on PA2 with DMA");
-    let west =
-        hal::usart::Uart::new_half_duplex::<0>(p.USART2, p.PA2, p.DMA1_CH7, p.DMA1_CH6, config)
-            .unwrap();
-    let (mut west_tx, mut west_rx) = west.split();
+    // Switch to PLL as system clock
+    rcc.cfgr0().modify(|w| w.set_sw(Sw::PLL));
+    while rcc.cfgr0().read().sws() != Sw::PLL {}
 
-    // USART3 - North (PB10) with DMA1_CH2 (TX) and DMA1_CH3 (RX)
-    println!("Init USART3 (North) on PB10 with DMA");
-    let north =
-        hal::usart::Uart::new_half_duplex::<0>(p.USART3, p.PB10, p.DMA1_CH2, p.DMA1_CH3, config)
-            .unwrap();
-    let (mut north_tx, mut north_rx) = north.split();
+    // Enable peripheral clocks
+    rcc.apb2pcenr().modify(|w| {
+        w.set_iopcen(true); // GPIOC clock
+        w.set_iopben(true); // GPIOB clock for SPI1
+        w.set_afioen(true); // AFIO clock
+        w.set_spi1en(true); // SPI1 clock
+    });
 
-    // USART4 - East (PB0 with REMAP=0) with DMA1_CH1 (TX) and DMA1_CH8 (RX)
-    println!("Init USART4 (East) on PB0 with DMA");
-    let east =
-        hal::usart::Uart::new_half_duplex::<1>(p.USART4, p.PB0, p.DMA1_CH1, p.DMA1_CH8, config)
-            .unwrap();
-    // Manually force USART4 remap to 0 to use PB0/PB1 pins (D6 variant mapping)
+    // Configure PC13 as push-pull output, 50 MHz
+    let gpioc = pac::GPIOC;
+    gpioc.cfghr().modify(|w| {
+        w.set_mode(13 - 8, Mode::OUTPUT_50MHZ);
+        w.set_cnf(13 - 8, Cnf::ANALOG_IN__PUSH_PULL_OUT);
+    });
+
+    // Configure SPI1 pins
+    let gpiob = pac::GPIOB;
+    // PB3: SCK - Alternate function push-pull
+    // PB5: MOSI - Alternate function push-pull
+    gpiob.cfglr().modify(|w| {
+        w.set_mode(3, Mode::OUTPUT_50MHZ);
+        w.set_cnf(3, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // SCK
+        w.set_mode(5, Mode::OUTPUT_50MHZ);
+        w.set_cnf(5, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // MOSI
+    });
+
+    // Configure SPI1
+    // APB2 = 144 MHz, desired SPI clock = 4 MHz
+    // 144 MHz / 32 = 4.5 MHz (closest to 4 MHz)
+    let spi1 = pac::SPI1;
+    spi1.ctlr1().modify(|w| {
+        w.set_cpha(false); // Clock phase: first edge
+        w.set_cpol(false); // Clock polarity: low when idle
+        w.set_mstr(true); // Master mode
+        w.set_br(BaudRate::DIV_32); // Baud rate: APB2/32 = ~4.5 MHz
+        w.set_spe(false); // SPI disabled during configuration
+        w.set_lsbfirst(false); // MSB first
+        w.set_ssi(true); // Internal slave select high
+        w.set_ssm(true); // Software slave management
+        w.set_rxonly(false); // Full duplex
+        w.set_dff(true); // 16-bit data frame format
+        w.set_crcen(false); // CRC disabled
+        w.set_bidimode(false); // 2-line unidirectional mode
+    });
+
+    compiler_fence(Ordering::SeqCst);
+
+    // Enable SPI1
+    spi1.ctlr1().modify(|w| w.set_spe(true));
+
+    compiler_fence(Ordering::SeqCst);
+
+    // Enable SPI1 interrupt in PFIC
     unsafe {
-        hal::pac::AFIO.pcfr2().modify(|w| w.set_usart4_rm(0));
+        qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
     }
-    let (mut east_tx, mut east_rx) = east.split();
 
-    println!("All USARTs configured with DMA successfully");
+    // Test: Send some data
+    for i in 0..10 {
+        let _ = spi_push(0xAA00 | i);
+    }
 
-    let mut south_rx_buf = [0u8; 3];
-    let mut west_rx_buf = [0u8; 3];
-    let mut north_rx_buf = [0u8; 3];
-    let mut east_rx_buf = [0u8; 3];
-    let mut iteration = 0u32;
-
+    // Blink loop
     loop {
-        iteration = iteration.wrapping_add(1);
+        // Toggle PC13
+        pac::GPIOC.bshr().write(|w| w.set_bs(13, true));
+        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
 
-        // Test South (USART1) - Concurrently send and read from other ports
-        {
-            use embassy_futures::join::join4;
-
-            let send = async {
-                south_tx.write(b"SOUTH").await.ok();
-                println!("[{}] Sent from SOUTH via DMA", iteration);
-            };
-
-            let read_west = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    west_rx.read(&mut west_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> WEST received bytes: {:?}", &west_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_north = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    north_rx.read(&mut north_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> NORTH received bytes: {:?}", &north_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_east = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    east_rx.read(&mut east_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> EAST received bytes: {:?}", &east_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            join4(send, read_west, read_north, read_east).await;
-        }
-
-        // Test West (USART2) - Concurrently send and read from other ports
-        {
-            use embassy_futures::join::join4;
-
-            let send = async {
-                west_tx.write(b"WEST").await.ok();
-                println!("[{}] Sent from WEST via DMA", iteration);
-            };
-
-            let read_south = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    south_rx.read(&mut south_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> SOUTH received bytes: {:?}", &south_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_north = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    north_rx.read(&mut north_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> NORTH received bytes: {:?}", &north_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_east = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    east_rx.read(&mut east_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> EAST received bytes: {:?}", &east_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            join4(send, read_south, read_north, read_east).await;
-        }
-
-        // Test North (USART3) - Concurrently send and read from other ports
-        {
-            use embassy_futures::join::join4;
-
-            let send = async {
-                north_tx.write(b"NORTH").await.ok();
-                println!("[{}] Sent from NORTH via DMA", iteration);
-            };
-
-            let read_south = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    south_rx.read(&mut south_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> SOUTH received bytes: {:?}", &south_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_west = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    west_rx.read(&mut west_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> WEST received bytes: {:?}", &west_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_east = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    east_rx.read(&mut east_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> EAST received bytes: {:?}", &east_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            join4(send, read_south, read_west, read_east).await;
-        }
-
-        // Test East (USART4) - Concurrently send and read from other ports
-        {
-            use embassy_futures::join::join4;
-
-            let send = async {
-                east_tx.write(b"EAST").await.ok();
-                println!("[{}] Sent from EAST via DMA", iteration);
-            };
-
-            let read_south = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    south_rx.read(&mut south_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> SOUTH received bytes: {:?}", &south_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_west = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    west_rx.read(&mut west_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> WEST received bytes: {:?}", &west_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            let read_north = async {
-                match embassy_time::with_timeout(
-                    embassy_time::Duration::from_millis(10),
-                    north_rx.read(&mut north_rx_buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        println!("  -> NORTH received bytes: {:?}", &north_rx_buf);
-                    }
-                    _ => {}
-                }
-            };
-
-            join4(send, read_south, read_west, read_north).await;
-        }
-
-        // Longer pause after testing all 4 directions
-        println!("--- Cycle {} complete, pausing ---\n", iteration);
-        Timer::after_millis(1000).await;
+        pac::GPIOC.bshr().write(|w| w.set_br(13, true));
+        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
     }
 }
-
-/*
-#[embassy_executor::main(entry = "ch32_hal::entry")]
-async fn main(_spawner: embassy_executor::Spawner) -> ! {
-    let p = hal::init(Default::default());
-
-    // PB3 = LED power enable (active low)
-    let _led_enable =
-        hal::gpio::OutputOpenDrain::new(p.PB3, hal::gpio::Level::Low, Default::default());
-
-    // Configure SPI1 for WS2812 control on PB5 (MOSI)
-    // SPI frequency: aim for ~6.4 MHz for WS2812 timing
-    // With 8 MHz system clock, divider of 2 gives 4 MHz (close enough)
-    let mut spi_config = hal::spi::Config::default();
-    spi_config.frequency = hal::time::Hertz(4_000_000);
-    let mut spi = hal::spi::Spi::new_txonly_nosck(p.SPI1, p.PB5, p.DMA1_CH3, spi_config);
-
-    loop {
-        ws2812_update(&mut spi, 5, 0, 0).await;
-        Timer::after_millis(500).await;
-        ws2812_update(&mut spi, 0, 5, 0).await;
-        Timer::after_millis(500).await;
-        ws2812_update(&mut spi, 0, 0, 5).await;
-        Timer::after_millis(500).await;
-    }
-}
-*/
