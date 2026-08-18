@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use ch32_metapac as pac;
 use pac::gpio::vals::{Cnf, Mode};
@@ -9,202 +9,193 @@ use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
 use panic_halt as _;
 
-// Ring buffer configuration
-const RING_BUFFER_SIZE: usize = 256;
-
-/// Lock-free SPSC (Single Producer Single Consumer) ring buffer
-/// Producer (main thread) writes to head, Consumer (interrupt) reads from tail
-struct RingBuffer {
-    buffer: [u16; RING_BUFFER_SIZE],
-    head: AtomicUsize,  // Modified only by producer
-    tail: AtomicUsize,  // Modified only by consumer
-}
-
-impl RingBuffer {
-    const fn new() -> Self {
-        Self {
-            buffer: [0; RING_BUFFER_SIZE],
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-        }
-    }
-
-    /// Push a value (called only from main thread - single producer)
-    fn push(&self, value: u16) -> Result<(), ()> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire); // Acquire to sync with consumer
-        let next_head = (head + 1) % RING_BUFFER_SIZE;
-
-        if next_head == tail {
-            return Err(()); // Buffer full
-        }
-
-        // SAFETY: Single producer, we have exclusive write access to head position
-        unsafe {
-            let buf_ptr = self.buffer.as_ptr() as *mut u16;
-            buf_ptr.add(head).write(value);
-        }
-
-        // Release store to make data visible to consumer
-        self.head.store(next_head, Ordering::Release);
-        Ok(())
-    }
-
-    /// Pop a value (called only from interrupt - single consumer)
-    fn pop(&self) -> Option<u16> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire); // Acquire to sync with producer
-
-        if head == tail {
-            return None; // Buffer empty
-        }
-
-        // SAFETY: Single consumer, we have exclusive read access to tail position
-        let value = unsafe {
-            let buf_ptr = self.buffer.as_ptr();
-            buf_ptr.add(tail).read()
-        };
-
-        let next_tail = (tail + 1) % RING_BUFFER_SIZE;
-        // Release store to make space visible to producer
-        self.tail.store(next_tail, Ordering::Release);
-
-        Some(value)
-    }
-}
+const LED_BUFFER_COUNT: usize = 1024;
 
 // Global ring buffer
-static TX_BUFFER: RingBuffer = RingBuffer::new();
+static LED_BUFFER: fring::Buffer<u16, LED_BUFFER_COUNT> = fring::Buffer::new();
 
-/// Push data to SPI transmit buffer and start transmission if needed
-///
-/// This is lock-free! We use the peripheral's TXE flag and TXEIE bit as synchronization:
-/// - Enabling TXEIE when TXE is set causes the interrupt to fire
-/// - The interrupt drains the buffer and disables TXEIE when empty
-/// - Next push re-enables TXEIE, restarting the cycle
-pub fn spi_push(data: u16) -> Result<(), ()> {
-    // Add data to buffer (lock-free SPSC)
-    TX_BUFFER.push(data)?;
+struct Hardware {
+    leds: Leds,
+    led_pwr: LedPwr,
+}
 
-    // Enable interrupt. If TXE is set (peripheral ready), interrupt fires immediately.
-    // If TXE is clear (transmission in progress), interrupt fires when TXE becomes set.
-    let spi1 = pac::SPI1;
-    spi1.ctlr2().modify(|w| w.set_txeie(true));
+impl Hardware {
+    pub fn init() -> Self {
+        // Configure system clock to 144 MHz from HSI
+        // HSI = 8 MHz, PLL = HSI * 18 = 144 MHz
+        // Enable HSI
+        pac::RCC.ctlr().modify(|w| w.set_hsion(true));
+        while !pac::RCC.ctlr().read().hsirdy() {}
 
-    Ok(())
+        // Configure main PLL: HSI * 18 = 144 MHz
+        pac::RCC.cfgr0().modify(|w| {
+            w.set_pllsrc(false); // HSI as PLL source
+            w.set_pllmul(PllMul::MUL18); // PLL multiplier x18
+        });
+
+        // Configure bus prescalers (all DIV1)
+        pac::RCC.cfgr0().modify(|w| {
+            w.set_hpre(Hpre::DIV1); // AHB prescaler = 1
+            w.set_ppre1(Ppre::DIV1); // APB1 prescaler = 1
+            w.set_ppre2(Ppre::DIV1); // APB2 prescaler = 1
+        });
+
+        // Enable PLL
+        pac::RCC.ctlr().modify(|w| w.set_pllon(true));
+        while !pac::RCC.ctlr().read().pllrdy() {}
+
+        // Switch to PLL as system clock
+        pac::RCC.cfgr0().modify(|w| w.set_sw(Sw::PLL));
+        while pac::RCC.cfgr0().read().sws() != Sw::PLL {}
+
+        // Enable peripheral clocks
+        pac::RCC.apb2pcenr().modify(|w| {
+            //w.set_iopcen(true); // GPIOC clock
+            w.set_iopben(true); // GPIOB clock for SPI1
+            w.set_afioen(true); // AFIO clock
+            w.set_spi1en(true); // SPI1 clock
+        });
+
+        // PB3 enables LED power when high
+        // Configure as push-pull output, 50 MHz
+        // Start with it HIGH (power disabled)
+        pac::GPIOB.bshr().write(|w| w.set_bs(3, true));
+        compiler_fence(Ordering::SeqCst);
+        pac::GPIOB.cfglr().modify(|w| {
+            w.set_mode(3, Mode::OUTPUT_50MHZ);
+            w.set_cnf(3, Cnf::ANALOG_IN__PUSH_PULL_OUT);
+        });
+
+        // Configure SPI1 pins for WS2812 output
+        // PB5: MOSI
+        pac::GPIOB.cfglr().modify(|w| {
+            w.set_mode(5, Mode::OUTPUT_50MHZ);
+            w.set_cnf(5, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // TODO: Use open-drain
+        });
+        // SPI1_RM=1 in order to use PB5
+        pac::AFIO.pcfr1().modify(|w| {
+            w.set_spi1_rm(true);
+        });
+
+        // APB2 = 144 MHz, desired SPI clock = 4 MHz
+        // 144 MHz / 32 = 4.5 MHz (closest to 4 MHz)
+        pac::SPI1.ctlr1().modify(|w| {
+            w.set_cpha(false); // Clock phase: first edge
+            w.set_cpol(false); // Clock polarity: low when idle
+            w.set_mstr(true); // Master mode
+            w.set_br(BaudRate::DIV_32); // Baud rate: APB2/32 = ~4.5 MHz
+            w.set_spe(false); // SPI disabled during configuration
+            w.set_lsbfirst(false); // MSB first
+            w.set_ssi(true); // Internal slave select high
+            w.set_ssm(true); // Software slave management
+            w.set_rxonly(false); // Full duplex
+            w.set_dff(true); // 16-bit data frame format
+            w.set_crcen(false); // CRC disabled
+            w.set_bidimode(false); // 2-line unidirectional mode
+        });
+
+        // Enable SPI1 interrupt in PFIC
+        unsafe {
+            qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Enable SPI1
+        pac::SPI1.ctlr1().modify(|w| w.set_spe(true));
+
+        compiler_fence(Ordering::SeqCst);
+
+        Hardware {
+            leds: Leds {
+                buffer: unsafe { LED_BUFFER.producer() },
+            },
+            led_pwr: LedPwr {},
+        }
+    }
+}
+
+struct Leds {
+    buffer: fring::Producer<'static, u16, LED_BUFFER_COUNT>,
+}
+
+impl Leds {
+    /// Send new data to the LEDs.
+    /// The data is buffered and this function returns immediately.
+    /// Returns Ok(()) if the data was buffered and will be sent.
+    /// Returns Err(()) if there was insufficient space in the buffer for the given data.
+    pub fn spi_push(&mut self, data: &[u16]) -> Result<(), ()> {
+        if data.len() > self.buffer.empty_size() {
+            return Err(());
+        }
+
+        let data2 = {
+            let mut region1 = self.buffer.write(data.len());
+            let data1 = &data[..region1.len()];
+            region1.copy_from_slice(data1);
+            &data[region1.len()..]
+        };
+        if !data2.is_empty() {
+            // 2 writes should always be sufficient
+            // if there is available space
+            let mut region2 = self.buffer.write(data2.len());
+            region2.copy_from_slice(data2);
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Enable interrupt. If TXE is set (peripheral ready), interrupt fires immediately.
+        // If TXE is clear (transmission in progress), interrupt fires when TXE becomes set.
+        let spi1 = pac::SPI1;
+        spi1.ctlr2().modify(|w| w.set_txeie(true));
+
+        Ok(())
+    }
 }
 
 /// SPI1 interrupt handler
 /// Drains the ring buffer until empty, then disables itself
 #[qingke_rt::interrupt]
 fn SPI1() {
-    let spi1 = pac::SPI1;
+    let mut buffer = unsafe { LED_BUFFER.consumer() };
 
     // Check if TXE (transmit buffer empty) flag is set
-    if spi1.statr().read().txe() {
+    if pac::SPI1.statr().read().txe() {
         // Try to get next word from buffer
-        if let Some(word) = TX_BUFFER.pop() {
+        if let Some(&word) = buffer.read(1).first() {
             // More data to send
-            spi1.datar().write(|w| w.set_datar(word));
+            pac::SPI1.datar().write(|w| w.set_datar(word));
             // Interrupt stays enabled, will fire again when TXE becomes set
         } else {
             // Buffer empty - disable interrupt until next push
-            spi1.ctlr2().modify(|w| w.set_txeie(false));
+            pac::SPI1.ctlr2().modify(|w| w.set_txeie(false));
+        }
+    }
+}
+
+struct LedPwr {}
+
+impl LedPwr {
+    pub fn set_pwr(&mut self, on: bool) {
+        if on {
+            pac::GPIOB.bshr().write(|w| w.set_br(3, true));
+        } else {
+            pac::GPIOB.bshr().write(|w| w.set_bs(3, true));
         }
     }
 }
 
 #[qingke_rt::entry]
 fn main() -> ! {
-    // Configure system clock to 144 MHz from HSI
-    // HSI = 8 MHz, PLL = HSI * 18 = 144 MHz
-    let rcc = pac::RCC;
+    let Hardware {
+        mut leds,
+        mut led_pwr,
+    } = Hardware::init();
 
-    // Enable HSI
-    rcc.ctlr().modify(|w| w.set_hsion(true));
-    while !rcc.ctlr().read().hsirdy() {}
+    led_pwr.set_pwr(true);
 
-    // Configure main PLL: HSI * 18 = 144 MHz
-    rcc.cfgr0().modify(|w| {
-        w.set_pllsrc(false); // HSI as PLL source
-        w.set_pllmul(PllMul::MUL18); // PLL multiplier x18
-    });
-
-    // Configure bus prescalers (all DIV1)
-    rcc.cfgr0().modify(|w| {
-        w.set_hpre(Hpre::DIV1); // AHB prescaler = 1
-        w.set_ppre1(Ppre::DIV1); // APB1 prescaler = 1
-        w.set_ppre2(Ppre::DIV1); // APB2 prescaler = 1
-    });
-
-    // Enable PLL
-    rcc.ctlr().modify(|w| w.set_pllon(true));
-    while !rcc.ctlr().read().pllrdy() {}
-
-    // Switch to PLL as system clock
-    rcc.cfgr0().modify(|w| w.set_sw(Sw::PLL));
-    while rcc.cfgr0().read().sws() != Sw::PLL {}
-
-    // Enable peripheral clocks
-    rcc.apb2pcenr().modify(|w| {
-        w.set_iopcen(true); // GPIOC clock
-        w.set_iopben(true); // GPIOB clock for SPI1
-        w.set_afioen(true); // AFIO clock
-        w.set_spi1en(true); // SPI1 clock
-    });
-
-    // Configure PC13 as push-pull output, 50 MHz
-    let gpioc = pac::GPIOC;
-    gpioc.cfghr().modify(|w| {
-        w.set_mode(13 - 8, Mode::OUTPUT_50MHZ);
-        w.set_cnf(13 - 8, Cnf::ANALOG_IN__PUSH_PULL_OUT);
-    });
-
-    // Configure SPI1 pins
-    let gpiob = pac::GPIOB;
-    // PB3: SCK - Alternate function push-pull
-    // PB5: MOSI - Alternate function push-pull
-    gpiob.cfglr().modify(|w| {
-        w.set_mode(3, Mode::OUTPUT_50MHZ);
-        w.set_cnf(3, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // SCK
-        w.set_mode(5, Mode::OUTPUT_50MHZ);
-        w.set_cnf(5, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // MOSI
-    });
-
-    // Configure SPI1
-    // APB2 = 144 MHz, desired SPI clock = 4 MHz
-    // 144 MHz / 32 = 4.5 MHz (closest to 4 MHz)
-    let spi1 = pac::SPI1;
-    spi1.ctlr1().modify(|w| {
-        w.set_cpha(false); // Clock phase: first edge
-        w.set_cpol(false); // Clock polarity: low when idle
-        w.set_mstr(true); // Master mode
-        w.set_br(BaudRate::DIV_32); // Baud rate: APB2/32 = ~4.5 MHz
-        w.set_spe(false); // SPI disabled during configuration
-        w.set_lsbfirst(false); // MSB first
-        w.set_ssi(true); // Internal slave select high
-        w.set_ssm(true); // Software slave management
-        w.set_rxonly(false); // Full duplex
-        w.set_dff(true); // 16-bit data frame format
-        w.set_crcen(false); // CRC disabled
-        w.set_bidimode(false); // 2-line unidirectional mode
-    });
-
-    compiler_fence(Ordering::SeqCst);
-
-    // Enable SPI1
-    spi1.ctlr1().modify(|w| w.set_spe(true));
-
-    compiler_fence(Ordering::SeqCst);
-
-    // Enable SPI1 interrupt in PFIC
-    unsafe {
-        qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
-    }
-
-    // Test: Send some data
-    for i in 0..10 {
-        let _ = spi_push(0xAA00 | i);
+    loop {
+        let _ = leds.spi_push(&[0x0000; 64]);
     }
 
     // Blink loop
@@ -216,4 +207,5 @@ fn main() -> ! {
         pac::GPIOC.bshr().write(|w| w.set_br(13, true));
         riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
     }
+    */
 }

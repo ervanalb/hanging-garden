@@ -243,6 +243,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "fring"
+version = "0.4.0"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,9 +285,10 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-time",
+ "fring",
  "panic-halt",
  "portable-atomic",
- "qingke",
+ "qingke 0.7.0",
  "qingke-rt",
  "riscv 0.12.1",
 ]
@@ -433,6 +441,17 @@ version = "0.7.0"
 dependencies = [
  "bit_field",
  "cfg-if",
+ "riscv 0.15.0",
+]
+
+[[package]]
+name = "qingke"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6e6adbd788587b2f0893d36ef8dd1eb9e7f9b7a32678e9b43149df1880575a"
+dependencies = [
+ "bit_field",
+ "cfg-if",
  "critical-section",
  "riscv 0.15.0",
 ]
@@ -440,14 +459,18 @@ dependencies = [
 [[package]]
 name = "qingke-rt"
 version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f3f5debfcb74752c0949a1f2700e5c98a34ae06174b6551034d99de0d12f13c"
 dependencies = [
- "qingke",
+ "qingke 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "qingke-rt-macros",
 ]
 
 [[package]]
 name = "qingke-rt-macros"
 version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e26f9a1d7490c8c7e75ef095511c8b146a2958f27e4e3e9d3ce2411d948f07ff"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
