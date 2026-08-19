@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(static_mut_refs)]
 
 use core::sync::atomic::{Ordering, compiler_fence};
 
@@ -9,10 +10,63 @@ use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
 use panic_halt as _;
 
-const LED_BUFFER_COUNT: usize = 1024;
+const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 1024;
+
+struct LedFrameBuffer {
+    len: usize,
+    data: [u8; LED_FRAME_BUFFER_MAX_DATA_COUNT],
+}
+
+impl LedFrameBuffer {
+    pub fn fill_from_slice(&mut self, data: &[u8]) {
+        self.data[..data.len()].copy_from_slice(data);
+        self.len = data.len();
+    }
+
+    fn next_4bits(&self, nibble_index: &mut usize) -> Option<u16> {
+        if *nibble_index / 2 >= self.len {
+            return None;
+        }
+
+        // Get nibble to send in first 4 bits of `b`
+        let mut b = self.data[*nibble_index / 2];
+        if *nibble_index % 2 == 0 {
+            // Process high nibble first
+            b >>= 4;
+        }
+
+        // Convert `b` to WS2812 signalling
+        // This could probably be implemented with more clever bit-hacking
+        let mut out = 0_u16;
+        for _ in 0..4 {
+            out <<= 4;
+            if b & 0b1000 == 0 {
+                out |= 0b1000;
+            } else {
+                out |= 0b1110;
+            }
+            b <<= 1;
+        }
+        *nibble_index += 1;
+
+        Some(out)
+    }
+}
+
+struct LedTx {
+    region: fring::Region<'static, fring::Consumer<'static, LedFrameBuffer, 2>, LedFrameBuffer>,
+    nibble_index: usize,
+    reset_pulse_count: usize,
+}
 
 // Global ring buffer
-static LED_BUFFER: fring::Buffer<u16, LED_BUFFER_COUNT> = fring::Buffer::new();
+static LED_FRAME_BUFFERS: fring::Buffer<LedFrameBuffer, 2> = fring::Buffer::new();
+static mut LED_FRAME_BUFFERS_PRODUCER: fring::Producer<LedFrameBuffer, 2> =
+    unsafe { LED_FRAME_BUFFERS.producer() };
+static mut LED_FRAME_BUFFERS_CONSUMER: fring::Consumer<LedFrameBuffer, 2> =
+    unsafe { LED_FRAME_BUFFERS.consumer() };
+
+static mut LED_ACTIVE_TX: Option<LedTx> = None;
 
 struct Hardware {
     leds: Leds,
@@ -70,20 +124,20 @@ impl Hardware {
         // PB5: MOSI
         pac::GPIOB.cfglr().modify(|w| {
             w.set_mode(5, Mode::OUTPUT_50MHZ);
-            w.set_cnf(5, Cnf::PULL_IN__AF_PUSH_PULL_OUT); // TODO: Use open-drain
+            w.set_cnf(5, Cnf::AF_OPEN_DRAIN_OUT);
         });
         // SPI1_RM=1 in order to use PB5
         pac::AFIO.pcfr1().modify(|w| {
             w.set_spi1_rm(true);
         });
 
-        // APB2 = 144 MHz, desired SPI clock = 4 MHz
-        // 144 MHz / 32 = 4.5 MHz (closest to 4 MHz)
+        // APB2 = 144 MHz, desired SPI clock = 3.2 MHz
+        // 144 MHz / 32 / 2 = 2.25 MHz (closest to 3.2 MHz)
         pac::SPI1.ctlr1().modify(|w| {
             w.set_cpha(false); // Clock phase: first edge
             w.set_cpol(false); // Clock polarity: low when idle
             w.set_mstr(true); // Master mode
-            w.set_br(BaudRate::DIV_32); // Baud rate: APB2/32 = ~4.5 MHz
+            w.set_br(BaudRate::DIV_32); // Baud rate: APB2/64 = 2.25 MHz
             w.set_spe(false); // SPI disabled during configuration
             w.set_lsbfirst(false); // MSB first
             w.set_ssi(true); // Internal slave select high
@@ -107,39 +161,25 @@ impl Hardware {
         compiler_fence(Ordering::SeqCst);
 
         Hardware {
-            leds: Leds {
-                buffer: unsafe { LED_BUFFER.producer() },
-            },
+            leds: Leds {},
             led_pwr: LedPwr {},
         }
     }
 }
 
-struct Leds {
-    buffer: fring::Producer<'static, u16, LED_BUFFER_COUNT>,
-}
+struct Leds {}
 
 impl Leds {
-    /// Send new data to the LEDs.
+    /// Send a new frame to the LEDs.
     /// The data is buffered and this function returns immediately.
     /// Returns Ok(()) if the data was buffered and will be sent.
     /// Returns Err(()) if there was insufficient space in the buffer for the given data.
-    pub fn spi_push(&mut self, data: &[u16]) -> Result<(), ()> {
-        if data.len() > self.buffer.empty_size() {
-            return Err(());
-        }
-
-        let data2 = {
-            let mut region1 = self.buffer.write(data.len());
-            let data1 = &data[..region1.len()];
-            region1.copy_from_slice(data1);
-            &data[region1.len()..]
-        };
-        if !data2.is_empty() {
-            // 2 writes should always be sufficient
-            // if there is available space
-            let mut region2 = self.buffer.write(data2.len());
-            region2.copy_from_slice(data2);
+    pub fn write_slice(&mut self, data: &[u8]) -> Result<(), ()> {
+        {
+            let producer = unsafe { &mut LED_FRAME_BUFFERS_PRODUCER };
+            let mut region = producer.write(1);
+            let buffer = region.first_mut().ok_or(())?;
+            buffer.fill_from_slice(data);
         }
 
         compiler_fence(Ordering::SeqCst);
@@ -157,18 +197,51 @@ impl Leds {
 /// Drains the ring buffer until empty, then disables itself
 #[qingke_rt::interrupt]
 fn SPI1() {
-    let mut buffer = unsafe { LED_BUFFER.consumer() };
-
     // Check if TXE (transmit buffer empty) flag is set
-    if pac::SPI1.statr().read().txe() {
-        // Try to get next word from buffer
-        if let Some(&word) = buffer.read(1).first() {
-            // More data to send
-            pac::SPI1.datar().write(|w| w.set_datar(word));
-            // Interrupt stays enabled, will fire again when TXE becomes set
+    if !pac::SPI1.statr().read().txe() {
+        return;
+    }
+
+    loop {
+        // See if we have an in-progress frame and that frame has another 4 bits to send
+        if let Some(led_tx) = unsafe { LED_ACTIVE_TX.as_mut() } {
+            if let Some(word) = led_tx
+                .region
+                .first_mut()
+                .unwrap()
+                .next_4bits(&mut led_tx.nibble_index)
+            {
+                pac::SPI1.datar().write(|w| w.set_datar(word));
+                return;
+            }
+
+            // See if we are sending a reset pulse
+            if led_tx.reset_pulse_count < 20 {
+                pac::SPI1.datar().write(|w| w.set_datar(0x0000));
+                led_tx.reset_pulse_count += 1;
+                return;
+            }
+        }
+
+        // We don't have an in-progress frame, so see if there is one available.
+        let consumer = unsafe { &mut LED_FRAME_BUFFERS_CONSUMER };
+        let next_region = consumer.read(1);
+        if next_region.len() > 0 {
+            unsafe {
+                LED_ACTIVE_TX = Some(LedTx {
+                    region: next_region,
+                    nibble_index: 0,
+                    reset_pulse_count: 0,
+                });
+            }
+            // Loop--try to send data
         } else {
+            unsafe {
+                LED_ACTIVE_TX = None;
+            }
             // Buffer empty - disable interrupt until next push
             pac::SPI1.ctlr2().modify(|w| w.set_txeie(false));
+            return;
         }
     }
 }
@@ -195,9 +268,15 @@ fn main() -> ! {
     led_pwr.set_pwr(true);
 
     loop {
-        let _ = leds.spi_push(&[0x0000; 64]);
+        let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
+        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
+        let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+        riscv::asm::delay(7_200_000);
+        let _ = leds.write_slice(&[0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]);
+        riscv::asm::delay(7_200_000);
     }
 
+    /*
     // Blink loop
     loop {
         // Toggle PC13
