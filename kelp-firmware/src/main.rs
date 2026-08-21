@@ -2,9 +2,14 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+use core::future::poll_fn;
 use core::sync::atomic::{Ordering, compiler_fence};
+use core::task::Poll;
 
 use ch32_metapac as pac;
+use embassy_futures::yield_now;
+use embassy_sync::waitqueue::AtomicWaker;
+use pac::dma::vals::{Dir, Pl, Size};
 use pac::gpio::vals::{Cnf, Mode};
 use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
@@ -68,9 +73,160 @@ static mut LED_FRAME_BUFFERS_CONSUMER: fring::Consumer<LedFrameBuffer, 2> =
 
 static mut LED_ACTIVE_TX: Option<LedTx> = None;
 
+// USART TX wakers for async operations
+static USART1_TX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART2_TX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART3_TX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART4_TX_WAKER: AtomicWaker = AtomicWaker::new();
+
+/// USART TX handle for async operations
+pub struct UsartTx {
+    dma_ch: usize,
+    waker: &'static AtomicWaker,
+}
+
+impl UsartTx {
+    /// Async write to USART
+    pub async fn write(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        assert!(data.len() <= 0xFFFF, "Buffer too large for DMA");
+
+        // Configure DMA for this transfer
+        // Set peripheral and memory addresses
+        pac::DMA1
+            .ch(self.dma_ch - 1)
+            .mar()
+            .write_value(data.as_ptr() as u32);
+        pac::DMA1
+            .ch(self.dma_ch - 1)
+            .ndtr()
+            .write(|w| w.set_ndt(data.len() as u16));
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Start DMA transfer
+        pac::DMA1
+            .ch(self.dma_ch - 1)
+            .cr()
+            .modify(|w| w.set_en(true));
+
+        // Wait for transfer to complete
+        poll_fn(|cx| {
+            self.waker.register(cx.waker());
+
+            compiler_fence(Ordering::SeqCst);
+
+            // Check if transfer is complete
+            let cr = pac::DMA1.ch(self.dma_ch - 1).cr().read();
+            if !cr.en() {
+                // Transfer complete
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Initialize a USART peripheral in half-duplex mode at 1 Mbaud with DMA
+///
+/// # Arguments
+/// * `usart` - The USART peripheral to configure
+/// * `gpio_port` - The GPIO port for the TX pin
+/// * `gpio_pin` - The GPIO pin number for TX
+/// * `dma_tx_channel` - DMA channel number for TX (0-7)
+/// * `dma_rx_channel` - DMA channel number for RX (0-7)
+unsafe fn init_usart_halfduplex(
+    usart: pac::usart::Usart,
+    gpio_port: pac::gpio::Gpio,
+    gpio_pin: usize,
+    dma_tx_channel: usize,
+    dma_rx_channel: usize,
+) {
+    // Configure GPIO pin as alternate function push-pull
+    if gpio_pin >= 8 {
+        gpio_port.cfghr().modify(|w| {
+            w.set_mode(gpio_pin - 8, Mode::OUTPUT_50MHZ);
+            w.set_cnf(gpio_pin - 8, Cnf::AF_OPEN_DRAIN_OUT);
+        });
+    } else {
+        gpio_port.cfglr().modify(|w| {
+            w.set_mode(gpio_pin, Mode::OUTPUT_50MHZ);
+            w.set_cnf(gpio_pin, Cnf::AF_OPEN_DRAIN_OUT);
+        });
+    }
+
+    // Configure USART for half-duplex mode at 1 Mbaud
+    // Baud rate = APB2_CLK / (16 * USARTDIV) = 144 MHz / (16 * 9) = 1 Mbaud
+    usart.brr().write_value(pac::usart::regs::Brr(9));
+
+    usart.ctlr1().modify(|w| {
+        w.set_m(false); // 8 data bits
+        w.set_te(true); // Transmitter enable
+        w.set_re(true); // Receiver enable
+        w.set_idleie(true); // IDLE line interrupt enable
+    });
+
+    usart.ctlr3().modify(|w| {
+        w.set_hdsel(true); // Half-duplex mode
+        w.set_dmat(true); // DMA enable for transmitter
+        w.set_dmar(true); // DMA enable for receiver
+    });
+
+    // Configure DMA TX channel (one-shot mode)
+    pac::DMA1.ch(dma_tx_channel - 1).cr().write(|w| {
+        w.set_dir(Dir::FROMMEMORY); // Memory to peripheral
+        w.set_circ(false); // One-shot mode (not circular)
+        w.set_pinc(false); // Peripheral address fixed
+        w.set_minc(true); // Memory address increment
+        w.set_psize(Size::BITS8); // Peripheral data size: 8 bits
+        w.set_msize(Size::BITS8); // Memory data size: 8 bits
+        w.set_pl(Pl::MEDIUM); // Priority level: medium
+        w.set_tcie(true); // Transfer complete interrupt enable
+        w.set_teie(true); // Transfer error interrupt enable
+        w.set_en(false); // Channel disabled initially
+    });
+
+    pac::DMA1
+        .ch(dma_tx_channel - 1)
+        .par()
+        .write_value(usart.datar().as_ptr() as u32);
+
+    // Configure DMA RX channel (circular buffer mode)
+    pac::DMA1.ch(dma_rx_channel - 1).cr().write(|w| {
+        w.set_dir(Dir::FROMPERIPHERAL); // Peripheral to memory
+        w.set_circ(true); // Circular buffer mode
+        w.set_pinc(false); // Peripheral address fixed
+        w.set_minc(true); // Memory address increment
+        w.set_psize(Size::BITS8); // Peripheral data size: 8 bits
+        w.set_msize(Size::BITS8); // Memory data size: 8 bits
+        w.set_pl(Pl::MEDIUM); // Priority level: medium
+        w.set_htie(true); // Half-transfer interrupt enable
+        w.set_tcie(true); // Transfer complete interrupt enable
+        w.set_teie(true); // Transfer error interrupt enable
+        w.set_en(false); // Channel disabled initially
+    });
+
+    pac::DMA1
+        .ch(dma_rx_channel - 1)
+        .par()
+        .write_value(usart.datar().as_ptr() as u32);
+
+    compiler_fence(Ordering::SeqCst);
+
+    // Enable USART
+    usart.ctlr1().modify(|w| w.set_ue(true));
+}
+
+#[allow(dead_code)]
 struct Hardware {
     leds: Leds,
     led_pwr: LedPwr,
+    usarts_tx: [UsartTx; 4],
 }
 
 impl Hardware {
@@ -105,9 +261,19 @@ impl Hardware {
         // Enable peripheral clocks
         pac::RCC.apb2pcenr().modify(|w| {
             //w.set_iopcen(true); // GPIOC clock
-            w.set_iopben(true); // GPIOB clock for SPI1
+            w.set_iopaen(true); // GPIOA clock for USART1, USART2
+            w.set_iopben(true); // GPIOB clock for SPI1, USART3, USART4
             w.set_afioen(true); // AFIO clock
             w.set_spi1en(true); // SPI1 clock
+            w.set_usart1en(true); // USART1 clock
+        });
+        pac::RCC.apb1pcenr().modify(|w| {
+            w.set_usart2en(true); // USART2 clock
+            w.set_usart3en(true); // USART3 clock
+            w.set_usart4en(true); // USART4 clock
+        });
+        pac::RCC.ahbpcenr().modify(|w| {
+            w.set_dma1en(true); // DMA1 clock
         });
 
         // PB3 enables LED power when high
@@ -148,10 +314,101 @@ impl Hardware {
             w.set_bidimode(false); // 2-line unidirectional mode
         });
 
-        // Enable SPI1 interrupt in PFIC
+        // Configure interrupt nesting with 2 levels, 1 preemption bit (bit 7)
+        // INTSYSCR register (CSR 0x804):
+        //   bits[3:2] = PMTCFG = 0b01 (2 nested levels, bit7 is preemption bit)
+        //   bit[1] = INESTEN = 1 (interrupt nesting enabled)
+        //   bit[0] = HWSTKEN = 1 (hardware stack enabled)
+        // Value: 0b0000_0111 = 0x7
         unsafe {
-            qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
+            core::arch::asm!("csrw 0x804, {0}", in(reg) 0x7_usize);
         }
+
+        // Initialize all 4 USARTs in half-duplex mode at 1 Mbaud
+        unsafe {
+            // USART1: PA9, DMA1_CH4 (TX), DMA1_CH5 (RX)
+            init_usart_halfduplex(
+                pac::USART1,
+                pac::GPIOA,
+                9,
+                4, // DMA1_CH4 for TX
+                5, // DMA1_CH5 for RX
+            );
+
+            // USART2: PA2, DMA1_CH7 (TX), DMA1_CH6 (RX)
+            init_usart_halfduplex(
+                pac::USART2,
+                pac::GPIOA,
+                2,
+                7, // DMA1_CH7 for TX
+                6, // DMA1_CH6 for RX
+            );
+
+            // USART3: PB10, DMA1_CH2 (TX), DMA1_CH3 (RX)
+            init_usart_halfduplex(
+                pac::USART3,
+                pac::GPIOB,
+                10,
+                2, // DMA1_CH2 for TX
+                3, // DMA1_CH3 for RX
+            );
+
+            // USART4: PB0, DMA1_CH1 (TX), DMA1_CH8 (RX)
+            init_usart_halfduplex(
+                pac::USART4,
+                pac::GPIOB,
+                0,
+                1, // DMA1_CH1 for TX
+                8, // DMA1_CH8 for RX
+            );
+        }
+
+        // Enable all interrupts in PFIC with appropriate priorities
+        // For PMTCFG=0b01: bit7 is the preemption bit, 0x00 = high priority, 0x80 = low priority
+        unsafe {
+            // SPI1 has highest priority (can preempt all USART/DMA interrupts)
+            qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::SPI1 as u8, 0x00); // High preemption priority (bit7=0)
+
+            // USART1 and its DMA channels
+            qingke::pfic::enable_interrupt(pac::Interrupt::USART1 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::USART1 as u8, 0x80); // Low preemption priority (bit7=1)
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL4 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL4 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL5 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL5 as u8, 0x80);
+
+            // USART2 and its DMA channels
+            qingke::pfic::enable_interrupt(pac::Interrupt::USART2 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::USART2 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL7 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL7 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL6 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL6 as u8, 0x80);
+
+            // USART3 and its DMA channels
+            qingke::pfic::enable_interrupt(pac::Interrupt::USART3 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::USART3 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL2 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL2 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL3 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL3 as u8, 0x80);
+
+            // USART4 and its DMA channels
+            qingke::pfic::enable_interrupt(pac::Interrupt::UART4 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::UART4 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL1 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL1 as u8, 0x80);
+            qingke::pfic::enable_interrupt(pac::Interrupt::DMA1_CHANNEL8 as u8);
+            qingke::pfic::set_priority(pac::Interrupt::DMA1_CHANNEL8 as u8, 0x80);
+        }
+
+        // Enable SEVONPEND so WFI wakes on pending interrupts even when globally disabled
+        // From ch32-hal:
+        // > The WCH QingKe RISC-V core deviates from standard RISC-V specification:
+        // > - `WFI` instruction will not wake up from disabled interrupts
+        // > - Either `WFITOWFE` or `SEVONPEND` must be enabled for proper wake-up behavior
+        pac::PFIC.sctlr().modify(|w| w.set_sevonpend(true));
 
         compiler_fence(Ordering::SeqCst);
 
@@ -163,6 +420,29 @@ impl Hardware {
         Hardware {
             leds: Leds {},
             led_pwr: LedPwr {},
+            // Order: USART3, USART1, USART4, USART2
+            usarts_tx: [
+                UsartTx {
+                    //usart: pac::USART3,
+                    dma_ch: 2,
+                    waker: &USART3_TX_WAKER,
+                },
+                UsartTx {
+                    //usart: pac::USART1,
+                    dma_ch: 4,
+                    waker: &USART1_TX_WAKER,
+                },
+                UsartTx {
+                    //usart: pac::USART4,
+                    dma_ch: 1,
+                    waker: &USART4_TX_WAKER,
+                },
+                UsartTx {
+                    //usart: pac::USART2,
+                    dma_ch: 7,
+                    waker: &USART2_TX_WAKER,
+                },
+            ],
         }
     }
 }
@@ -193,6 +473,130 @@ impl Leds {
     }
 }
 
+/// USART1 interrupt handler (for IDLE line detection)
+#[qingke_rt::interrupt]
+fn USART1() {
+    // TODO: Handle USART1 interrupts
+}
+
+/// DMA1_CHANNEL4 interrupt handler (USART1 TX complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL4() {
+    let isr = pac::DMA1.isr().read();
+    if isr.teif(4 - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(4 - 1, true));
+        panic!("DMA1_CH4 transfer error");
+    }
+    if isr.tcif(4 - 1) {
+        // Disable transfer
+        pac::DMA1.ch(4 - 1).cr().modify(|w| w.set_en(false));
+        // Clear transfer complete flag
+        pac::DMA1.ifcr().write(|w| w.set_tcif(4 - 1, true));
+        compiler_fence(Ordering::SeqCst);
+        USART1_TX_WAKER.wake();
+    }
+}
+
+/// DMA1_CHANNEL5 interrupt handler (USART1 RX half-transfer and transfer complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL5() {
+    // TODO: Handle DMA1_CH5 half-transfer and transfer complete interrupts
+}
+
+/// USART2 interrupt handler (for IDLE line detection)
+#[qingke_rt::interrupt]
+fn USART2() {
+    // TODO: Handle USART2 interrupts
+}
+
+/// DMA1_CHANNEL7 interrupt handler (USART2 TX complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL7() {
+    let isr = pac::DMA1.isr().read();
+    if isr.teif(7 - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(7 - 1, true));
+        panic!("DMA1_CH7 transfer error");
+    }
+    if isr.tcif(7 - 1) {
+        // Disable transfer
+        pac::DMA1.ch(7 - 1).cr().modify(|w| w.set_en(false));
+        // Clear transfer complete flag
+        pac::DMA1.ifcr().write(|w| w.set_tcif(7 - 1, true));
+        compiler_fence(Ordering::SeqCst);
+        USART2_TX_WAKER.wake();
+    }
+}
+
+/// DMA1_CHANNEL6 interrupt handler (USART2 RX half-transfer and transfer complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL6() {
+    // TODO: Handle DMA1_CH6 half-transfer and transfer complete interrupts
+}
+
+/// USART3 interrupt handler (for IDLE line detection)
+#[qingke_rt::interrupt]
+fn USART3() {
+    // TODO: Handle USART3 interrupts
+}
+
+/// DMA1_CHANNEL2 interrupt handler (USART3 TX complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL2() {
+    let isr = pac::DMA1.isr().read();
+    if isr.teif(2 - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(2 - 1, true));
+        panic!("DMA1_CH2 transfer error");
+    }
+    if isr.tcif(2 - 1) {
+        // Disable transfer
+        pac::DMA1.ch(2 - 1).cr().modify(|w| w.set_en(false));
+        // Clear transfer complete flag
+        pac::DMA1.ifcr().write(|w| w.set_tcif(2 - 1, true));
+        compiler_fence(Ordering::SeqCst);
+        USART3_TX_WAKER.wake();
+    }
+}
+
+/// DMA1_CHANNEL3 interrupt handler (USART3 RX half-transfer and transfer complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL3() {
+    // TODO: Handle DMA1_CH3 half-transfer and transfer complete interrupts
+}
+
+/// UART4 interrupt handler (for IDLE line detection)
+#[qingke_rt::interrupt]
+fn UART4() {
+    // TODO: Handle UART4 interrupts
+}
+
+/// DMA1_CHANNEL1 interrupt handler (UART4 TX complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL1() {
+    let isr = pac::DMA1.isr().read();
+    if isr.teif(1 - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(1 - 1, true));
+        panic!("DMA1_CH1 transfer error");
+    }
+    if isr.tcif(1 - 1) {
+        // Disable transfer
+        pac::DMA1.ch(1 - 1).cr().modify(|w| w.set_en(false));
+        // Clear transfer complete flag
+        pac::DMA1.ifcr().write(|w| w.set_tcif(1 - 1, true));
+        compiler_fence(Ordering::SeqCst);
+        USART4_TX_WAKER.wake();
+    }
+}
+
+/// DMA1_CHANNEL8 interrupt handler (UART4 RX half-transfer and transfer complete)
+#[qingke_rt::interrupt]
+fn DMA1_CHANNEL8() {
+    // TODO: Handle DMA1_CH8 half-transfer and transfer complete interrupts
+}
+
 /// SPI1 interrupt handler
 /// Drains the ring buffer until empty, then disables itself
 #[qingke_rt::interrupt]
@@ -220,8 +624,13 @@ fn SPI1() {
                 pac::SPI1.datar().write(|w| w.set_datar(0x0000));
                 led_tx.reset_pulse_count += 1;
                 return;
+            } else {
+                unsafe {
+                    LED_ACTIVE_TX = None;
+                }
             }
         }
+        compiler_fence(Ordering::SeqCst);
 
         // We don't have an in-progress frame, so see if there is one available.
         let consumer = unsafe { &mut LED_FRAME_BUFFERS_CONSUMER };
@@ -236,9 +645,6 @@ fn SPI1() {
             }
             // Loop--try to send data
         } else {
-            unsafe {
-                LED_ACTIVE_TX = None;
-            }
             // Buffer empty - disable interrupt until next push
             pac::SPI1.ctlr2().modify(|w| w.set_txeie(false));
             return;
@@ -258,33 +664,53 @@ impl LedPwr {
     }
 }
 
+#[embassy_executor::task]
+async fn main_task(
+    mut leds: Leds,
+    mut north_tx: UsartTx,
+    mut south_tx: UsartTx,
+    mut east_tx: UsartTx,
+    mut west_tx: UsartTx,
+) {
+    loop {
+        let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
+        north_tx.write(b"NORTH\r\n").await;
+        south_tx.write(b"SOUTH\r\n").await;
+        east_tx.write(b"EAST\r\n").await;
+        west_tx.write(b"WEST\r\n").await;
+
+        // Delay using busy-wait (replace with timer when time driver is set up)
+        for _ in 0..10 {
+            riscv::asm::delay(720_000); // ~50ms per iteration, 500ms total
+            yield_now().await;
+        }
+        let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+        for _ in 0..10 {
+            riscv::asm::delay(720_000); // ~50ms per iteration, 500ms total
+            yield_now().await;
+        }
+    }
+}
+
 #[qingke_rt::entry]
 fn main() -> ! {
     let Hardware {
-        mut leds,
+        leds,
         mut led_pwr,
+        usarts_tx: [north_tx, south_tx, east_tx, west_tx],
     } = Hardware::init();
 
     led_pwr.set_pwr(true);
 
-    loop {
-        let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
-        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
-        let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
-        riscv::asm::delay(7_200_000);
-        let _ = leds.write_slice(&[0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]);
-        riscv::asm::delay(7_200_000);
-    }
+    // Create executor
+    let executor = embassy_executor::Executor::new();
+    let executor = unsafe {
+        static mut EXECUTOR: core::mem::MaybeUninit<embassy_executor::Executor> =
+            core::mem::MaybeUninit::uninit();
+        EXECUTOR.write(executor)
+    };
 
-    /*
-    // Blink loop
-    loop {
-        // Toggle PC13
-        pac::GPIOC.bshr().write(|w| w.set_bs(13, true));
-        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
-
-        pac::GPIOC.bshr().write(|w| w.set_br(13, true));
-        riscv::asm::delay(7_200_000); // ~0.5s at 144 MHz
-    }
-    */
+    executor.run(|spawner| {
+        spawner.spawn(main_task(leds, north_tx, south_tx, east_tx, west_tx).expect("spawn"));
+    });
 }

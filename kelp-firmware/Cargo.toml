@@ -15,11 +15,11 @@ fring = { path = "../../fring", features = ["portable-atomic"] }
 panic-halt = "1.0"
 
 embassy-executor = { version = "0.10.0", features = [
-    "platform-spin",
+    "platform-riscv32",
     "executor-thread",
 ] }
-embassy-time = "0.5.1"
 embassy-futures = "0.1.1"
+embassy-sync = "0.7.0"
 
 [profile.release]
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
