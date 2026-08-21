@@ -623,23 +623,29 @@ fn USART1() {
     // TODO: Handle USART1 interrupts
 }
 
+/// Generic USART TX DMA interrupt handler
+#[inline]
+fn handle_usart_tx_dma_interrupt(channel: usize, waker: &AtomicWaker) {
+    let isr = pac::DMA1.isr().read();
+    if isr.teif(channel - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(channel - 1, true));
+        panic!("DMA1_CH{} transfer error", channel);
+    }
+    if isr.tcif(channel - 1) {
+        // Disable transfer
+        pac::DMA1.ch(channel - 1).cr().modify(|w| w.set_en(false));
+        // Clear transfer complete flag
+        pac::DMA1.ifcr().write(|w| w.set_tcif(channel - 1, true));
+        compiler_fence(Ordering::SeqCst);
+        waker.wake();
+    }
+}
+
 /// DMA1_CHANNEL4 interrupt handler (USART1 TX complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL4() {
-    let isr = pac::DMA1.isr().read();
-    if isr.teif(4 - 1) {
-        // Clear error flag
-        pac::DMA1.ifcr().write(|w| w.set_teif(4 - 1, true));
-        panic!("DMA1_CH4 transfer error");
-    }
-    if isr.tcif(4 - 1) {
-        // Disable transfer
-        pac::DMA1.ch(4 - 1).cr().modify(|w| w.set_en(false));
-        // Clear transfer complete flag
-        pac::DMA1.ifcr().write(|w| w.set_tcif(4 - 1, true));
-        compiler_fence(Ordering::SeqCst);
-        USART1_TX_WAKER.wake();
-    }
+    handle_usart_tx_dma_interrupt(4, &USART1_TX_WAKER);
 }
 
 /// DMA1_CHANNEL5 interrupt handler (USART1 RX half-transfer and transfer complete)
@@ -657,20 +663,7 @@ fn USART2() {
 /// DMA1_CHANNEL7 interrupt handler (USART2 TX complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL7() {
-    let isr = pac::DMA1.isr().read();
-    if isr.teif(7 - 1) {
-        // Clear error flag
-        pac::DMA1.ifcr().write(|w| w.set_teif(7 - 1, true));
-        panic!("DMA1_CH7 transfer error");
-    }
-    if isr.tcif(7 - 1) {
-        // Disable transfer
-        pac::DMA1.ch(7 - 1).cr().modify(|w| w.set_en(false));
-        // Clear transfer complete flag
-        pac::DMA1.ifcr().write(|w| w.set_tcif(7 - 1, true));
-        compiler_fence(Ordering::SeqCst);
-        USART2_TX_WAKER.wake();
-    }
+    handle_usart_tx_dma_interrupt(7, &USART2_TX_WAKER);
 }
 
 /// DMA1_CHANNEL6 interrupt handler (USART2 RX half-transfer and transfer complete)
@@ -688,20 +681,7 @@ fn USART3() {
 /// DMA1_CHANNEL2 interrupt handler (USART3 TX complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL2() {
-    let isr = pac::DMA1.isr().read();
-    if isr.teif(2 - 1) {
-        // Clear error flag
-        pac::DMA1.ifcr().write(|w| w.set_teif(2 - 1, true));
-        panic!("DMA1_CH2 transfer error");
-    }
-    if isr.tcif(2 - 1) {
-        // Disable transfer
-        pac::DMA1.ch(2 - 1).cr().modify(|w| w.set_en(false));
-        // Clear transfer complete flag
-        pac::DMA1.ifcr().write(|w| w.set_tcif(2 - 1, true));
-        compiler_fence(Ordering::SeqCst);
-        USART3_TX_WAKER.wake();
-    }
+    handle_usart_tx_dma_interrupt(2, &USART3_TX_WAKER);
 }
 
 /// DMA1_CHANNEL3 interrupt handler (USART3 RX half-transfer and transfer complete)
@@ -719,20 +699,7 @@ fn UART4() {
 /// DMA1_CHANNEL1 interrupt handler (UART4 TX complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL1() {
-    let isr = pac::DMA1.isr().read();
-    if isr.teif(1 - 1) {
-        // Clear error flag
-        pac::DMA1.ifcr().write(|w| w.set_teif(1 - 1, true));
-        panic!("DMA1_CH1 transfer error");
-    }
-    if isr.tcif(1 - 1) {
-        // Disable transfer
-        pac::DMA1.ch(1 - 1).cr().modify(|w| w.set_en(false));
-        // Clear transfer complete flag
-        pac::DMA1.ifcr().write(|w| w.set_tcif(1 - 1, true));
-        compiler_fence(Ordering::SeqCst);
-        USART4_TX_WAKER.wake();
-    }
+    handle_usart_tx_dma_interrupt(1, &USART4_TX_WAKER);
 }
 
 /// DMA1_CHANNEL8 interrupt handler (UART4 RX half-transfer and transfer complete)
