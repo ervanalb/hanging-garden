@@ -2,18 +2,147 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+use core::cell::RefCell;
 use core::future::poll_fn;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU32, Ordering, compiler_fence};
 use core::task::Poll;
 
 use ch32_metapac as pac;
-use embassy_futures::yield_now;
+use critical_section::CriticalSection;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::Timer;
+use embassy_time_driver::Driver;
+use embassy_time_queue_utils::Queue;
 use pac::dma::vals::{Dir, Pl, Size};
 use pac::gpio::vals::{Cnf, Mode};
 use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
+use pac::systick::vals;
 use panic_halt as _;
+
+pub struct SystickDriver {
+    cnt_per_tick: AtomicU32,
+    queue: Mutex<CriticalSectionRawMutex, RefCell<Queue>>,
+}
+
+embassy_time_driver::time_driver_impl!(static TIME_DRIVER: SystickDriver = SystickDriver {
+    cnt_per_tick: AtomicU32::new(1), // avoid div by zero
+    queue: Mutex::new(RefCell::new(Queue::new()))
+});
+
+impl SystickDriver {
+    fn init(&'static self, _cs: CriticalSection, hclk: u32) {
+        let r = &pac::SYSTICK;
+        let hclk = hclk as u64;
+
+        let cnt_per_second = hclk / 8; // HCLK/8
+        let cnt_per_tick = cnt_per_second / embassy_time_driver::TICK_HZ;
+
+        self.cnt_per_tick
+            .store(cnt_per_tick as u32, Ordering::Relaxed);
+
+        r.ctlr().write(|w| {
+            w.set_init(true); // Initialize counter
+            w.set_ste(true); // Enable counter
+        });
+
+        // Write 0 to both halves of the compare register
+        r.cmph().write_value(0);
+        r.cmpl().write_value(0);
+
+        // Count value compare flag
+        r.sr().write(|w| w.set_cntif(false)); // clear
+
+        // Configuration: Upcount, No reload, HCLK/8 as clock source
+        r.ctlr().modify(|w| {
+            w.set_mode(vals::Mode::UPCOUNT); // Counter mode
+            w.set_stre(false); // Auto reload count enable bit
+            w.set_stclk(vals::Stclk::HCLK_DIV8); // Counter system clock source selection bit
+        });
+    }
+
+    fn on_interrupt(&self) {
+        let r = &pac::SYSTICK;
+        // Count value compare flag
+        r.sr().write(|w| w.set_cntif(false)); // clear IF
+
+        critical_section::with(|cs| {
+            self.trigger_alarm(cs);
+        });
+    }
+
+    #[inline]
+    fn raw_cnt(&self) -> u64 {
+        let r = pac::SYSTICK;
+        r.cnt().read()
+    }
+
+    fn trigger_alarm(&self, cs: CriticalSection) {
+        let mut next = self
+            .queue
+            .borrow(cs)
+            .borrow_mut()
+            .next_expiration(self.raw_cnt());
+        while !self.set_alarm(cs, next) {
+            next = self
+                .queue
+                .borrow(cs)
+                .borrow_mut()
+                .next_expiration(self.raw_cnt());
+        }
+    }
+
+    fn set_alarm(&self, _cs: CriticalSection, next_alarm_cnt: u64) -> bool {
+        let r = &pac::SYSTICK;
+
+        if next_alarm_cnt <= self.raw_cnt() {
+            return false;
+        }
+
+        // Counter interrupt enable control bit
+        r.cmph().write_value((next_alarm_cnt >> 32) as u32);
+        r.cmpl().write_value((next_alarm_cnt) as u32);
+        r.ctlr().modify(|w| w.set_stie(true));
+        r.sr().write(|w| w.set_cntif(false));
+
+        if next_alarm_cnt <= self.raw_cnt() {
+            // If alarm timestamp has passed the alarm will not fire.
+            // Disarm the alarm and return `false` to indicate that.
+            r.ctlr().modify(|w| w.set_stie(false));
+            r.sr().write(|w| w.set_cntif(false));
+            return false;
+        }
+
+        true
+    }
+}
+
+impl Driver for SystickDriver {
+    fn now(&self) -> u64 {
+        let cnt_per_tick = self.cnt_per_tick.load(Ordering::Relaxed) as u64;
+        self.raw_cnt() / cnt_per_tick
+    }
+
+    fn schedule_wake(&self, ticks: u64, waker: &core::task::Waker) {
+        let cnt_per_tick = self.cnt_per_tick.load(Ordering::Relaxed) as u64;
+        critical_section::with(|cs| {
+            let mut queue = self.queue.borrow(cs).borrow_mut();
+
+            if queue.schedule_wake(ticks * cnt_per_tick, waker) {
+                let mut next = queue.next_expiration(self.raw_cnt());
+                while !self.set_alarm(cs, next) {
+                    next = queue.next_expiration(self.raw_cnt());
+                }
+            }
+        })
+    }
+}
+
+// ============================================================================
+// LED and USART driver code
+// ============================================================================
 
 const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 1024;
 
@@ -258,6 +387,11 @@ impl Hardware {
         pac::RCC.cfgr0().modify(|w| w.set_sw(Sw::PLL));
         while pac::RCC.cfgr0().read().sws() != Sw::PLL {}
 
+        // Initialize embassy time driver with SysTick (HCLK = 144 MHz)
+        critical_section::with(|cs| {
+            TIME_DRIVER.init(cs, 144_000_000);
+        });
+
         // Enable peripheral clocks
         pac::RCC.apb2pcenr().modify(|w| {
             //w.set_iopcen(true); // GPIOC clock
@@ -370,6 +504,10 @@ impl Hardware {
             qingke::pfic::enable_interrupt(pac::Interrupt::SPI1 as u8);
             qingke::pfic::set_priority(pac::Interrupt::SPI1 as u8, 0x00); // High preemption priority (bit7=0)
 
+            // SysTick for embassy_time
+            qingke::pfic::enable_interrupt(qingke_rt::CoreInterrupt::SysTick as u8);
+            qingke::pfic::set_priority(qingke_rt::CoreInterrupt::SysTick as u8, 0xFF); // Lowest priority
+
             // USART1 and its DMA channels
             qingke::pfic::enable_interrupt(pac::Interrupt::USART1 as u8);
             qingke::pfic::set_priority(pac::Interrupt::USART1 as u8, 0x80); // Low preemption priority (bit7=1)
@@ -471,6 +609,12 @@ impl Leds {
 
         Ok(())
     }
+}
+
+/// SysTick interrupt, for embassy time driver
+#[qingke_rt::interrupt(core)]
+fn SysTick() {
+    TIME_DRIVER.on_interrupt();
 }
 
 /// USART1 interrupt handler (for IDLE line detection)
@@ -679,16 +823,11 @@ async fn main_task(
         east_tx.write(b"EAST\r\n").await;
         west_tx.write(b"WEST\r\n").await;
 
-        // Delay using busy-wait (replace with timer when time driver is set up)
-        for _ in 0..10 {
-            riscv::asm::delay(720_000); // ~50ms per iteration, 500ms total
-            yield_now().await;
-        }
+        Timer::after_millis(500).await;
+
         let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
-        for _ in 0..10 {
-            riscv::asm::delay(720_000); // ~50ms per iteration, 500ms total
-            yield_now().await;
-        }
+
+        Timer::after_millis(500).await;
     }
 }
 
