@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU32, Ordering, compiler_fence};
 use core::task::Poll;
 
 use ch32_metapac as pac;
+use core::panic::PanicInfo;
 use critical_section::CriticalSection;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -15,7 +16,16 @@ use pac::gpio::vals::{Cnf, Mode};
 use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
 use pac::systick::vals;
-use panic_halt as _;
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    riscv::asm::delay(1_000_000);
+    use crate::println;
+    println!("*** PANIC ***");
+    println!("{}", info);
+    loop {}
+}
 
 // Constants for SDI print
 pub const DEBUG_DATA0_ADDRESS: *mut u32 = 0xE000_0380 as *mut u32;
@@ -257,6 +267,12 @@ static USART2_TX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART3_TX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART4_TX_WAKER: AtomicWaker = AtomicWaker::new();
 
+// USART RX wakers for async operations
+static USART1_RX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART2_RX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART3_RX_WAKER: AtomicWaker = AtomicWaker::new();
+static USART4_RX_WAKER: AtomicWaker = AtomicWaker::new();
+
 // USART RX circular DMA buffers
 const USART_RX_DMA_BUFFER_SIZE: usize = 64;
 static mut USART1_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
@@ -265,7 +281,7 @@ static mut USART3_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_D
 static mut USART4_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 
 // USART RX fring buffers
-const USART_RX_CAPACITY: usize = 1024;
+pub const USART_RX_CAPACITY: usize = 1024;
 static USART1_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
 static USART2_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
 static USART3_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
@@ -447,7 +463,44 @@ unsafe fn init_usart_halfduplex(
     usart.ctlr1().modify(|w| w.set_ue(true));
 }
 
-pub type UsartRx = fring::Consumer<'static, u8, USART_RX_CAPACITY>;
+/// USART RX handle for async operations
+pub struct UsartRx {
+    consumer: fring::Consumer<'static, u8, USART_RX_CAPACITY>,
+    waker: &'static AtomicWaker,
+}
+
+impl UsartRx {
+    /// Async read from USART RX buffer
+    /// Waits until data is available, then returns a fring::Region with all available data
+    pub async fn read(
+        &mut self,
+        target_len: usize,
+    ) -> fring::Region<'_, fring::Consumer<'static, u8, USART_RX_CAPACITY>, u8> {
+        poll_fn(|cx| {
+            self.waker.register(cx.waker());
+
+            compiler_fence(Ordering::SeqCst);
+
+            // Check if data is available
+            if self.consumer.data_size() > 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        // Data is available, return the region
+        self.consumer.read(target_len)
+    }
+
+    pub fn read_nb(
+        &mut self,
+        target_len: usize,
+    ) -> fring::Region<'_, fring::Consumer<'static, u8, USART_RX_CAPACITY>, u8> {
+        self.consumer.read(target_len)
+    }
+}
 
 #[allow(dead_code)]
 pub struct Hardware {
@@ -691,10 +744,22 @@ impl Hardware {
                 },
             ],
             usarts_rx: [
-                unsafe { USART3_RX_FRING.consumer() },
-                unsafe { USART1_RX_FRING.consumer() },
-                unsafe { USART4_RX_FRING.consumer() },
-                unsafe { USART2_RX_FRING.consumer() },
+                UsartRx {
+                    consumer: unsafe { USART3_RX_FRING.consumer() },
+                    waker: &USART3_RX_WAKER,
+                },
+                UsartRx {
+                    consumer: unsafe { USART1_RX_FRING.consumer() },
+                    waker: &USART1_RX_WAKER,
+                },
+                UsartRx {
+                    consumer: unsafe { USART4_RX_FRING.consumer() },
+                    waker: &USART4_RX_WAKER,
+                },
+                UsartRx {
+                    consumer: unsafe { USART2_RX_FRING.consumer() },
+                    waker: &USART2_RX_WAKER,
+                },
             ],
         }
     }
@@ -742,6 +807,7 @@ fn USART1() {
             &USART1_RX_DMA_BUFFER,
             &mut USART1_RX_FRING_PRODUCER,
             &mut USART1_RX_LAST_POS,
+            &USART1_RX_WAKER,
         );
     }
 }
@@ -774,6 +840,7 @@ fn handle_usart_rx_copy(
     dma_buffer: &'static [u8],
     producer: &mut fring::Producer<u8, USART_RX_CAPACITY>,
     last_pos: &mut usize,
+    waker: &AtomicWaker,
 ) {
     // Check and clear USART IDLE flag
     let statr = usart.statr().read();
@@ -825,6 +892,9 @@ fn handle_usart_rx_copy(
         let _ = producer.write_slice(&dma_buffer[..current_pos]);
     }
     *last_pos = current_pos;
+
+    compiler_fence(Ordering::SeqCst);
+    waker.wake();
 }
 
 /// DMA1_CHANNEL4 interrupt handler (USART1 TX complete)
@@ -843,6 +913,7 @@ fn DMA1_CHANNEL5() {
             &USART1_RX_DMA_BUFFER,
             &mut USART1_RX_FRING_PRODUCER,
             &mut USART1_RX_LAST_POS,
+            &USART1_RX_WAKER,
         );
     }
 }
@@ -857,6 +928,7 @@ fn USART2() {
             &USART2_RX_DMA_BUFFER,
             &mut USART2_RX_FRING_PRODUCER,
             &mut USART2_RX_LAST_POS,
+            &USART2_RX_WAKER,
         );
     }
 }
@@ -877,6 +949,7 @@ fn DMA1_CHANNEL6() {
             &USART2_RX_DMA_BUFFER,
             &mut USART2_RX_FRING_PRODUCER,
             &mut USART2_RX_LAST_POS,
+            &USART2_RX_WAKER,
         );
     }
 }
@@ -891,6 +964,7 @@ fn USART3() {
             &USART3_RX_DMA_BUFFER,
             &mut USART3_RX_FRING_PRODUCER,
             &mut USART3_RX_LAST_POS,
+            &USART3_RX_WAKER,
         );
     }
 }
@@ -911,6 +985,7 @@ fn DMA1_CHANNEL3() {
             &USART3_RX_DMA_BUFFER,
             &mut USART3_RX_FRING_PRODUCER,
             &mut USART3_RX_LAST_POS,
+            &USART3_RX_WAKER,
         );
     }
 }
@@ -925,6 +1000,7 @@ fn UART4() {
             &USART4_RX_DMA_BUFFER,
             &mut USART4_RX_FRING_PRODUCER,
             &mut USART4_RX_LAST_POS,
+            &USART4_RX_WAKER,
         );
     }
 }
@@ -945,6 +1021,7 @@ fn DMA1_CHANNEL8() {
             &USART4_RX_DMA_BUFFER,
             &mut USART4_RX_FRING_PRODUCER,
             &mut USART4_RX_LAST_POS,
+            &USART4_RX_WAKER,
         );
     }
 }

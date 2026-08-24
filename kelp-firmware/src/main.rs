@@ -4,8 +4,25 @@
 
 mod hal;
 
-use hal::{Hardware, Leds, UsartTx, UsartRx};
 use embassy_time::Timer;
+use hal::{Hardware, Leds, USART_RX_CAPACITY, UsartRx, UsartTx};
+
+impl UsartRx {
+    async fn read_until_zero(
+        &mut self,
+    ) -> fring::Region<'_, fring::Consumer<'static, u8, USART_RX_CAPACITY>, u8> {
+        let region = self.read(usize::MAX).await;
+        let mut null_index = region.len() - 1;
+        for i in 0..region.len() {
+            if region[i] == 0 {
+                null_index = i;
+                break;
+            }
+        }
+        core::mem::forget(region);
+        self.read_nb(null_index + 1)
+    }
+}
 
 #[embassy_executor::task]
 async fn main_task(
@@ -14,10 +31,6 @@ async fn main_task(
     mut south_tx: UsartTx,
     mut east_tx: UsartTx,
     mut west_tx: UsartTx,
-    mut north_rx: UsartRx,
-    mut south_rx: UsartRx,
-    mut east_rx: UsartRx,
-    mut west_rx: UsartRx,
 ) {
     loop {
         println!("Tick");
@@ -31,27 +44,27 @@ async fn main_task(
         west_tx.write(b"\0WEST\0").await;
         Timer::after_millis(10).await;
 
-        for (usart_rx, name) in [
-            (&mut north_rx, "North"),
-            (&mut south_rx, "South"),
-            (&mut east_rx, "East"),
-            (&mut west_rx, "West"),
-        ] {
-            let mut available = usart_rx.data_size();
-            while available > 0 {
-                let len = available.min(16);
-                let rx = &mut [0; 16][..len];
-                usart_rx.read_slice(rx);
-                println!("{} RX {:?} {:?}", name, rx, core::str::from_utf8(rx));
-                available = usart_rx.data_size();
-            }
-        }
-
         Timer::after_millis(500).await;
 
         let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
 
         Timer::after_millis(500).await;
+    }
+}
+
+#[embassy_executor::task(pool_size = 4)]
+async fn rx_task(name: &'static str, mut usart_rx: UsartRx) {
+    loop {
+        let region = usart_rx.read_until_zero().await;
+        if region.first().map(|&f| f == 0).unwrap_or(false) {
+            continue;
+        }
+        println!(
+            "{} RX {:?} {:?}",
+            name,
+            &region[..],
+            core::str::from_utf8(&region[..])
+        );
     }
 }
 
@@ -75,11 +88,10 @@ fn main() -> ! {
     };
 
     executor.run(|spawner| {
-        spawner.spawn(
-            main_task(
-                leds, north_tx, south_tx, east_tx, west_tx, north_rx, south_rx, east_rx, west_rx,
-            )
-            .expect("spawn"),
-        );
+        spawner.spawn(main_task(leds, north_tx, south_tx, east_tx, west_tx).unwrap());
+        spawner.spawn(rx_task("North", north_rx).expect("north"));
+        spawner.spawn(rx_task("South", south_rx).expect("south"));
+        spawner.spawn(rx_task("East", east_rx).expect("east"));
+        spawner.spawn(rx_task("West", west_rx).expect("west"));
     });
 }
