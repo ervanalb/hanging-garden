@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.dependencies]
 qingke-rt = { version = "0.7", features = ["v4"] }
 qingke = { path = "../../ch32-rs/qingke", version = "0.7" }
-ch32-metapac = { path = "../../ch32-rs/ch32-metapac", features = ["ch32v203c8u6", "rt", "memory-x"] }
+ch32-metapac = { path = "../../ch32-rs/ch32-metapac", features = ["ch32v203c8u6", "rt"] }
 riscv = "0.12"
 critical-section = "1.2"
 portable-atomic = { version = "1.9", features = ["critical-section"] }

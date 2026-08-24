@@ -1,13 +1,8 @@
-MEMORY
-{
-    /* Bootloader occupies first 32K of flash */
-    CODE   (rx)  : ORIGIN = 0x00000000, LENGTH =  16K
-    USR    (rwx) : ORIGIN = 0x08000000, LENGTH =  16K
-    SYS    (rwx) : ORIGIN = 0x1FFF8000, LENGTH =   28K
-    VND    (r)   : ORIGIN = 0x1FFFF700, LENGTH =   256
-    OPT    (rw)  : ORIGIN = 0x1FFFF800, LENGTH =   128
-    RAM    (rwx) : ORIGIN = 0x20000000, LENGTH =   20K
-}
+/* Bootloader memory aliases - references unified memory.x at workspace root */
+INCLUDE unified_memory.x
+
+REGION_ALIAS("CODE", BOOTLOADER_FLASH);
+REGION_ALIAS("USR", BOOTLOADER_USR);
 
 REGION_ALIAS("FLASH", CODE);
 
