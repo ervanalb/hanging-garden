@@ -22,6 +22,60 @@ use pac::spi::vals::BaudRate;
 use pac::systick::vals;
 use panic_halt as _;
 
+// Constants for SDI print
+pub const DEBUG_DATA0_ADDRESS: *mut u32 = 0xE000_0380 as *mut u32;
+pub const DEBUG_DATA1_ADDRESS: *mut u32 = 0xE000_0384 as *mut u32;
+
+struct SDIPrint {}
+
+impl core::fmt::Write for SDIPrint {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let mut data = [0u8; 8];
+        for chunk in s.as_bytes().chunks(7) {
+            data[1..chunk.len() + 1].copy_from_slice(chunk);
+            data[0] = chunk.len() as u8;
+
+            // data1 is the last 4 bytes of data
+            let data1 = u32::from_le_bytes(data[4..].try_into().unwrap());
+            let data0 = u32::from_le_bytes(data[..4].try_into().unwrap());
+
+            // Wait for not busy
+            unsafe { while core::ptr::read_volatile(DEBUG_DATA0_ADDRESS) != 0 {} }
+
+            unsafe {
+                core::ptr::write_volatile(DEBUG_DATA1_ADDRESS, data1);
+                core::ptr::write_volatile(DEBUG_DATA0_ADDRESS, data0);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        {
+            use core::fmt::Write;
+            use core::writeln;
+
+            writeln!(&mut SDIPrint {}, $($arg)*).unwrap();
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        {
+            use core::fmt::Write;
+            use core::write;
+
+            write!(&mut SDIPrint {}, $($arg)*).unwrap();
+        }
+    }
+}
+
 pub struct SystickDriver {
     cnt_per_tick: AtomicU32,
     queue: Mutex<CriticalSectionRawMutex, RefCell<Queue>>,
@@ -208,6 +262,35 @@ static USART2_TX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART3_TX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART4_TX_WAKER: AtomicWaker = AtomicWaker::new();
 
+// USART RX circular DMA buffers
+const USART_RX_DMA_BUFFER_SIZE: usize = 64;
+static mut USART1_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
+static mut USART2_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
+static mut USART3_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
+static mut USART4_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
+
+// USART RX fring buffers
+const USART_RX_CAPACITY: usize = 1024;
+static USART1_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
+static USART2_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
+static USART3_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
+static USART4_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
+
+static mut USART1_RX_FRING_PRODUCER: fring::Producer<u8, USART_RX_CAPACITY> =
+    unsafe { USART1_RX_FRING.producer() };
+static mut USART2_RX_FRING_PRODUCER: fring::Producer<u8, USART_RX_CAPACITY> =
+    unsafe { USART2_RX_FRING.producer() };
+static mut USART3_RX_FRING_PRODUCER: fring::Producer<u8, USART_RX_CAPACITY> =
+    unsafe { USART3_RX_FRING.producer() };
+static mut USART4_RX_FRING_PRODUCER: fring::Producer<u8, USART_RX_CAPACITY> =
+    unsafe { USART4_RX_FRING.producer() };
+
+// Track last DMA read position for each USART
+static mut USART1_RX_LAST_POS: usize = 0;
+static mut USART2_RX_LAST_POS: usize = 0;
+static mut USART3_RX_LAST_POS: usize = 0;
+static mut USART4_RX_LAST_POS: usize = 0;
+
 /// USART TX handle for async operations
 pub struct UsartTx {
     dma_ch: usize,
@@ -269,12 +352,14 @@ impl UsartTx {
 /// * `gpio_pin` - The GPIO pin number for TX
 /// * `dma_tx_channel` - DMA channel number for TX (0-7)
 /// * `dma_rx_channel` - DMA channel number for RX (0-7)
+/// * `rx_dma_buffer` - Pointer to the circular RX DMA buffer
 unsafe fn init_usart_halfduplex(
     usart: pac::usart::Usart,
     gpio_port: pac::gpio::Gpio,
     gpio_pin: usize,
     dma_tx_channel: usize,
     dma_rx_channel: usize,
+    rx_dma_buffer: &'static mut [u8],
 ) {
     // Configure GPIO pin as alternate function push-pull
     if gpio_pin >= 8 {
@@ -345,17 +430,36 @@ unsafe fn init_usart_halfduplex(
         .par()
         .write_value(usart.datar().as_ptr() as u32);
 
+    // Set RX DMA memory address and buffer size
+    pac::DMA1
+        .ch(dma_rx_channel - 1)
+        .mar()
+        .write_value(rx_dma_buffer.as_ptr() as u32);
+    pac::DMA1
+        .ch(dma_rx_channel - 1)
+        .ndtr()
+        .write(|w| w.set_ndt(rx_dma_buffer.len() as u16));
+
+    // Enable RX DMA channel
+    pac::DMA1
+        .ch(dma_rx_channel - 1)
+        .cr()
+        .modify(|w| w.set_en(true));
+
     compiler_fence(Ordering::SeqCst);
 
     // Enable USART
     usart.ctlr1().modify(|w| w.set_ue(true));
 }
 
+type UsartRx = fring::Consumer<'static, u8, USART_RX_CAPACITY>;
+
 #[allow(dead_code)]
 struct Hardware {
     leds: Leds,
     led_pwr: LedPwr,
     usarts_tx: [UsartTx; 4],
+    usarts_rx: [UsartRx; 4],
 }
 
 impl Hardware {
@@ -409,6 +513,12 @@ impl Hardware {
         pac::RCC.ahbpcenr().modify(|w| {
             w.set_dma1en(true); // DMA1 clock
         });
+
+        unsafe {
+            // Enable SDI print
+            core::ptr::write_volatile(DEBUG_DATA0_ADDRESS, 0);
+            riscv::asm::delay(100000);
+        }
 
         // PB3 enables LED power when high
         // Configure as push-pull output, 50 MHz
@@ -467,6 +577,7 @@ impl Hardware {
                 9,
                 4, // DMA1_CH4 for TX
                 5, // DMA1_CH5 for RX
+                &mut USART1_RX_DMA_BUFFER,
             );
 
             // USART2: PA2, DMA1_CH7 (TX), DMA1_CH6 (RX)
@@ -476,6 +587,7 @@ impl Hardware {
                 2,
                 7, // DMA1_CH7 for TX
                 6, // DMA1_CH6 for RX
+                &mut USART2_RX_DMA_BUFFER,
             );
 
             // USART3: PB10, DMA1_CH2 (TX), DMA1_CH3 (RX)
@@ -485,6 +597,7 @@ impl Hardware {
                 10,
                 2, // DMA1_CH2 for TX
                 3, // DMA1_CH3 for RX
+                &mut USART3_RX_DMA_BUFFER,
             );
 
             // USART4: PB0, DMA1_CH1 (TX), DMA1_CH8 (RX)
@@ -494,6 +607,7 @@ impl Hardware {
                 0,
                 1, // DMA1_CH1 for TX
                 8, // DMA1_CH8 for RX
+                &mut USART4_RX_DMA_BUFFER,
             );
         }
 
@@ -581,6 +695,12 @@ impl Hardware {
                     waker: &USART2_TX_WAKER,
                 },
             ],
+            usarts_rx: [
+                unsafe { USART3_RX_FRING.consumer() },
+                unsafe { USART1_RX_FRING.consumer() },
+                unsafe { USART4_RX_FRING.consumer() },
+                unsafe { USART2_RX_FRING.consumer() },
+            ],
         }
     }
 }
@@ -620,7 +740,15 @@ fn SysTick() {
 /// USART1 interrupt handler (for IDLE line detection)
 #[qingke_rt::interrupt]
 fn USART1() {
-    // TODO: Handle USART1 interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART1,
+            5,
+            &USART1_RX_DMA_BUFFER,
+            &mut USART1_RX_FRING_PRODUCER,
+            &mut USART1_RX_LAST_POS,
+        );
+    }
 }
 
 /// Generic USART TX DMA interrupt handler
@@ -642,6 +770,68 @@ fn handle_usart_tx_dma_interrupt(channel: usize, waker: &AtomicWaker) {
     }
 }
 
+/// Generic USART RX handler - handles data copy from DMA buffer to fring
+/// Checks for overrun, clears DMA and USART IDLE flags if set, and copies new data
+#[inline]
+fn handle_usart_rx_copy(
+    usart: pac::usart::Usart,
+    channel: usize,
+    dma_buffer: &'static [u8],
+    producer: &mut fring::Producer<u8, USART_RX_CAPACITY>,
+    last_pos: &mut usize,
+) {
+    // Check and clear USART IDLE flag
+    let statr = usart.statr().read();
+    if statr.idle() {
+        // Clear IDLE flag by reading STATR then DATAR
+        let _ = usart.datar().read().dr();
+    }
+
+    let isr = pac::DMA1.isr().read();
+
+    if isr.teif(channel - 1) {
+        // Clear error flag
+        pac::DMA1.ifcr().write(|w| w.set_teif(channel - 1, true));
+        panic!("DMA1_CH{} RX transfer error", channel);
+    }
+
+    let htif = isr.htif(channel - 1);
+    let tcif = isr.tcif(channel - 1);
+
+    // Clear DMA interrupt flags if they're set
+    if htif {
+        pac::DMA1.ifcr().write(|w| w.set_htif(channel - 1, true));
+    }
+    if tcif {
+        pac::DMA1.ifcr().write(|w| w.set_tcif(channel - 1, true));
+    }
+
+    // Get current DMA position
+    let ndtr = pac::DMA1.ch(channel - 1).ndtr().read().ndt() as usize;
+    let buffer_size = dma_buffer.len();
+    let current_pos = buffer_size - ndtr;
+
+    // Check for overrun: both HT and TC set means we're too slow
+    if htif && tcif {
+        // Overrun: skip copying, just update position to current DMA position
+        *last_pos = current_pos;
+    }
+
+    if current_pos == *last_pos {
+        return;
+    }
+
+    if current_pos > *last_pos {
+        // Copy 1 congiguous src region
+        let _ = producer.write_slice(&dma_buffer[*last_pos..current_pos]);
+    } else {
+        // Wraparound--copy 2 congiguous src regions
+        let _ = producer.write_slice(&dma_buffer[*last_pos..]);
+        let _ = producer.write_slice(&dma_buffer[..current_pos]);
+    }
+    *last_pos = current_pos;
+}
+
 /// DMA1_CHANNEL4 interrupt handler (USART1 TX complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL4() {
@@ -651,13 +841,29 @@ fn DMA1_CHANNEL4() {
 /// DMA1_CHANNEL5 interrupt handler (USART1 RX half-transfer and transfer complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL5() {
-    // TODO: Handle DMA1_CH5 half-transfer and transfer complete interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART1,
+            5,
+            &USART1_RX_DMA_BUFFER,
+            &mut USART1_RX_FRING_PRODUCER,
+            &mut USART1_RX_LAST_POS,
+        );
+    }
 }
 
 /// USART2 interrupt handler (for IDLE line detection)
 #[qingke_rt::interrupt]
 fn USART2() {
-    // TODO: Handle USART2 interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART2,
+            6,
+            &USART2_RX_DMA_BUFFER,
+            &mut USART2_RX_FRING_PRODUCER,
+            &mut USART2_RX_LAST_POS,
+        );
+    }
 }
 
 /// DMA1_CHANNEL7 interrupt handler (USART2 TX complete)
@@ -669,13 +875,29 @@ fn DMA1_CHANNEL7() {
 /// DMA1_CHANNEL6 interrupt handler (USART2 RX half-transfer and transfer complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL6() {
-    // TODO: Handle DMA1_CH6 half-transfer and transfer complete interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART2,
+            6,
+            &USART2_RX_DMA_BUFFER,
+            &mut USART2_RX_FRING_PRODUCER,
+            &mut USART2_RX_LAST_POS,
+        );
+    }
 }
 
 /// USART3 interrupt handler (for IDLE line detection)
 #[qingke_rt::interrupt]
 fn USART3() {
-    // TODO: Handle USART3 interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART3,
+            3,
+            &USART3_RX_DMA_BUFFER,
+            &mut USART3_RX_FRING_PRODUCER,
+            &mut USART3_RX_LAST_POS,
+        );
+    }
 }
 
 /// DMA1_CHANNEL2 interrupt handler (USART3 TX complete)
@@ -687,13 +909,29 @@ fn DMA1_CHANNEL2() {
 /// DMA1_CHANNEL3 interrupt handler (USART3 RX half-transfer and transfer complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL3() {
-    // TODO: Handle DMA1_CH3 half-transfer and transfer complete interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART3,
+            3,
+            &USART3_RX_DMA_BUFFER,
+            &mut USART3_RX_FRING_PRODUCER,
+            &mut USART3_RX_LAST_POS,
+        );
+    }
 }
 
-/// UART4 interrupt handler (for IDLE line detection)
+/// USART4 interrupt handler (for IDLE line detection)
 #[qingke_rt::interrupt]
 fn UART4() {
-    // TODO: Handle UART4 interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART4,
+            8,
+            &USART4_RX_DMA_BUFFER,
+            &mut USART4_RX_FRING_PRODUCER,
+            &mut USART4_RX_LAST_POS,
+        );
+    }
 }
 
 /// DMA1_CHANNEL1 interrupt handler (UART4 TX complete)
@@ -705,7 +943,15 @@ fn DMA1_CHANNEL1() {
 /// DMA1_CHANNEL8 interrupt handler (UART4 RX half-transfer and transfer complete)
 #[qingke_rt::interrupt]
 fn DMA1_CHANNEL8() {
-    // TODO: Handle DMA1_CH8 half-transfer and transfer complete interrupts
+    unsafe {
+        handle_usart_rx_copy(
+            pac::USART4,
+            8,
+            &USART4_RX_DMA_BUFFER,
+            &mut USART4_RX_FRING_PRODUCER,
+            &mut USART4_RX_LAST_POS,
+        );
+    }
 }
 
 /// SPI1 interrupt handler
@@ -782,13 +1028,38 @@ async fn main_task(
     mut south_tx: UsartTx,
     mut east_tx: UsartTx,
     mut west_tx: UsartTx,
+    mut north_rx: UsartRx,
+    mut south_rx: UsartRx,
+    mut east_rx: UsartRx,
+    mut west_rx: UsartRx,
 ) {
     loop {
+        println!("Tick");
         let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
-        north_tx.write(b"NORTH\r\n").await;
-        south_tx.write(b"SOUTH\r\n").await;
-        east_tx.write(b"EAST\r\n").await;
-        west_tx.write(b"WEST\r\n").await;
+        north_tx.write(b"\0NORTH\0").await;
+        Timer::after_millis(10).await;
+        south_tx.write(b"\0SOUTH\0").await;
+        Timer::after_millis(10).await;
+        east_tx.write(b"\0EAST\0").await;
+        Timer::after_millis(10).await;
+        west_tx.write(b"\0WEST\0").await;
+        Timer::after_millis(10).await;
+
+        for (usart_rx, name) in [
+            (&mut north_rx, "North"),
+            (&mut south_rx, "South"),
+            (&mut east_rx, "East"),
+            (&mut west_rx, "West"),
+        ] {
+            let mut available = usart_rx.data_size();
+            while available > 0 {
+                let len = available.min(16);
+                let rx = &mut [0; 16][..len];
+                usart_rx.read_slice(rx);
+                println!("{} RX {:?} {:?}", name, rx, core::str::from_utf8(rx));
+                available = usart_rx.data_size();
+            }
+        }
 
         Timer::after_millis(500).await;
 
@@ -804,6 +1075,7 @@ fn main() -> ! {
         leds,
         mut led_pwr,
         usarts_tx: [north_tx, south_tx, east_tx, west_tx],
+        usarts_rx: [north_rx, south_rx, east_rx, west_rx],
     } = Hardware::init();
 
     led_pwr.set_pwr(true);
@@ -817,6 +1089,11 @@ fn main() -> ! {
     };
 
     executor.run(|spawner| {
-        spawner.spawn(main_task(leds, north_tx, south_tx, east_tx, west_tx).expect("spawn"));
+        spawner.spawn(
+            main_task(
+                leds, north_tx, south_tx, east_tx, west_tx, north_rx, south_rx, east_rx, west_rx,
+            )
+            .expect("spawn"),
+        );
     });
 }

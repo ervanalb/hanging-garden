@@ -10,12 +10,14 @@ ch32-metapac = { path = "../../ch32-rs/ch32-metapac", features = ["ch32v203c8u6"
 riscv = "0.12"
 critical-section = "1.2"
 portable-atomic = { version = "1.9", features = ["critical-section"] }
-fring = { path = "../../fring", features = ["portable-atomic"] }
+fring = { version = "0.5", features = ["portable-atomic"] }
+heapless = { version = "0.9" }
 
 panic-halt = "1.0"
 
 embassy-executor = { version = "0.10.0", features = [
-    "platform-riscv32",
+    #"platform-riscv32", # WFI is acting up
+    "platform-spin",
     "executor-thread",
 ] }
 embassy-futures = "0.1.1"

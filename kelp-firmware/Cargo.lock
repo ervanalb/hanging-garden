@@ -290,7 +290,9 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fring"
-version = "0.4.0"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3816e27c06cdd5f6e3db774c418a7b5f69a9853aff417fc567ecf924ebcfc8c"
 dependencies = [
  "portable-atomic",
 ]
@@ -370,6 +372,7 @@ dependencies = [
  "embassy-time-driver",
  "embassy-time-queue-utils",
  "fring",
+ "heapless 0.9.3",
  "panic-halt",
  "portable-atomic",
  "qingke 0.7.0",
