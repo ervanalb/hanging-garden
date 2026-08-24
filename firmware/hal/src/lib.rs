@@ -20,6 +20,13 @@ use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
 use pac::systick::vals;
 
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    static _sbootloader: ();
+    static _sapp: ();
+    static _sflash: ();
+}
+
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -557,6 +564,15 @@ impl Hardware {
         // Switch to PLL as system clock
         pac::RCC.cfgr0().modify(|w| w.set_sw(Sw::PLL));
         while pac::RCC.cfgr0().read().sws() != Sw::PLL {}
+
+        // Set mtvec to point to the vector table
+        // Use VectoredAddress mode for absolute addressing
+        unsafe {
+            qingke::register::mtvec::write(
+                &_sflash as *const () as usize,
+                qingke::register::mtvec::TrapMode::VectoredAddress,
+            );
+        }
 
         // Initialize embassy time driver with SysTick (HCLK = 144 MHz)
         critical_section::with(|cs| {
@@ -1109,5 +1125,99 @@ impl LedPwr {
         } else {
             pac::GPIOB.bshr().write(|w| w.set_bs(3, true));
         }
+    }
+}
+
+/// Branch to bootloader or application firmware
+unsafe fn branch(addr: *const ()) -> ! {
+    critical_section::with(|_cs| {
+        // Reset all hardware peripherals using RCC reset registers
+        pac::RCC
+            .apb2prstr()
+            .write_value(pac::rcc::regs::Apb2prstr(0xFFFFFFFF));
+        pac::RCC
+            .apb1prstr()
+            .write_value(pac::rcc::regs::Apb1prstr(0xFFFFFFFF));
+        pac::RCC
+            .ahbrstr()
+            .write_value(pac::rcc::regs::Ahbrstr(0xFFFFFFFF));
+        compiler_fence(Ordering::SeqCst);
+        pac::RCC
+            .apb2prstr()
+            .write_value(pac::rcc::regs::Apb2prstr(0x00000000));
+        pac::RCC
+            .apb1prstr()
+            .write_value(pac::rcc::regs::Apb1prstr(0x00000000));
+        pac::RCC
+            .ahbrstr()
+            .write_value(pac::rcc::regs::Ahbrstr(0x00000000));
+
+        // Reset clock to default state (HSI only, no PLL)
+        // Switch to HSI before disabling PLL
+        pac::RCC.cfgr0().modify(|w| w.set_sw(Sw::HSI));
+        while pac::RCC.cfgr0().read().sws() != Sw::HSI {}
+        pac::RCC.ctlr().modify(|w| w.set_pllon(false));
+
+        // Reset bus prescalers to default (DIV1)
+        pac::RCC.cfgr0().modify(|w| {
+            w.set_hpre(Hpre::DIV1);
+            w.set_ppre1(Ppre::DIV1);
+            w.set_ppre2(Ppre::DIV1);
+        });
+
+        // Disable all peripheral clocks
+        pac::RCC
+            .apb2pcenr()
+            .write_value(pac::rcc::regs::Apb2pcenr(0));
+        pac::RCC
+            .apb1pcenr()
+            .write_value(pac::rcc::regs::Apb1pcenr(0));
+        pac::RCC.ahbpcenr().write_value(pac::rcc::regs::Ahbpcenr(0));
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Clear all interrupt enable and pending flags via PFIC
+        // Disable all interrupts in PFIC (using IRER registers)
+        const PFIC_IRER0: *mut u32 = 0xE000E180 as *mut u32;
+        for offset in 0..4 {
+            unsafe {
+                core::ptr::write_volatile(PFIC_IRER0.offset(offset), 0xFFFFFFFF);
+            }
+        }
+
+        // Clear all pending interrupts in PFIC (using IPRR registers)
+        const PFIC_IPRR0: *mut u32 = 0xE000E280 as *mut u32;
+        for offset in 0..4 {
+            unsafe {
+                core::ptr::write_volatile(PFIC_IPRR0.offset(offset), 0xFFFFFFFF);
+            }
+        }
+    });
+
+    compiler_fence(Ordering::SeqCst);
+
+    // Branch to the app
+    unsafe {
+        core::arch::asm!(
+            "jr {0}",
+            in(reg) addr,
+            options(noreturn)
+        );
+    }
+}
+
+/// Branch to application firmware.
+/// Safety: Must not be called from inside an interrupt.
+pub unsafe fn branch_to_app() -> ! {
+    unsafe {
+        branch(&_sapp);
+    }
+}
+
+/// Branch to bootloader.
+/// Safety: Must not be called from inside an interrupt.
+pub unsafe fn branch_to_bootloader() -> ! {
+    unsafe {
+        branch(&_sbootloader);
     }
 }

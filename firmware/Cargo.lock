@@ -36,6 +36,8 @@ checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
 name = "bootloader"
 version = "0.1.0"
 dependencies = [
+ "embassy-executor",
+ "embassy-time",
  "hal",
  "qingke-rt",
  "riscv 0.12.1",

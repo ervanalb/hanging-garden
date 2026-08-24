@@ -11,3 +11,5 @@ path = "src/main.rs"
 hal = { path = "../hal" }
 qingke-rt = { workspace = true }
 riscv = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
