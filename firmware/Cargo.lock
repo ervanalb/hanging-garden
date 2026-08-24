@@ -12,6 +12,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-time",
+ "fring",
+ "hal",
+ "qingke-rt",
+]
+
+[[package]]
 name = "bare-metal"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -31,6 +42,15 @@ name = "bitfield"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
+
+[[package]]
+name = "bootloader"
+version = "0.1.0"
+dependencies = [
+ "hal",
+ "qingke-rt",
+ "riscv 0.12.1",
+]
 
 [[package]]
 name = "byteorder"
@@ -325,6 +345,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hal"
+version = "0.1.0"
+dependencies = [
+ "ch32-metapac",
+ "critical-section",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-time-driver",
+ "embassy-time-queue-utils",
+ "fring",
+ "heapless 0.9.3",
+ "panic-halt",
+ "portable-atomic",
+ "qingke 0.7.0",
+ "qingke-rt",
+ "riscv 0.12.1",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,27 +399,6 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
-
-[[package]]
-name = "kelp-firmware"
-version = "0.1.0"
-dependencies = [
- "ch32-metapac",
- "critical-section",
- "embassy-executor",
- "embassy-futures",
- "embassy-sync",
- "embassy-time",
- "embassy-time-driver",
- "embassy-time-queue-utils",
- "fring",
- "heapless 0.9.3",
- "panic-halt",
- "portable-atomic",
- "qingke 0.7.0",
- "qingke-rt",
- "riscv 0.12.1",
-]
 
 [[package]]
 name = "lazy_static"

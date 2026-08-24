@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+hal = { path = "../hal" }
+qingke-rt = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+fring = { workspace = true }

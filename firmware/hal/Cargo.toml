@@ -1,0 +1,21 @@
+[package]
+name = "hal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+qingke-rt = { workspace = true }
+qingke = { workspace = true }
+ch32-metapac = { workspace = true }
+riscv = { workspace = true }
+critical-section = { workspace = true }
+portable-atomic = { workspace = true }
+fring = { workspace = true }
+heapless = { workspace = true }
+panic-halt = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-futures = { workspace = true }
+embassy-sync = { workspace = true }
+embassy-time = { workspace = true }
+embassy-time-driver = { workspace = true }
+embassy-time-queue-utils = { workspace = true }
