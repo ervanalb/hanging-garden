@@ -1,18 +1,18 @@
 MEMORY
 {
     /* Flash layout:
-     * 0x00000000 - 0x00003FFF: Bootloader (16K)
-     * 0x00004000 - 0x00037FFF: Application (196K)
+     * 0x00000000 - 0x00003FFF: Bootloader (32K)
+     * 0x00004000 - 0x00037FFF: Application (192K)
      */
-    BOOTLOADER_FLASH (rx)  : ORIGIN = 0x00000000, LENGTH =  16K
-    APP_FLASH        (rx)  : ORIGIN = 0x00004000, LENGTH = 196K
+    BOOTLOADER_FLASH (rx)  : ORIGIN = 0x00000000, LENGTH =  32K
+    APP_FLASH        (rx)  : ORIGIN = 0x00004000, LENGTH = 192K
 
     /* User flash layout (mirrors CODE flash):
-     * 0x08000000 - 0x08003FFF: Bootloader user flash (16K)
-     * 0x08004000 - 0x08037FFF: Application user flash (196K)
+     * 0x08000000 - 0x08003FFF: Bootloader user flash (32K)
+     * 0x08004000 - 0x08037FFF: Application user flash (192K)
      */
-    BOOTLOADER_USR (rwx) : ORIGIN = 0x08000000, LENGTH =  16K
-    APP_USR        (rwx) : ORIGIN = 0x08004000, LENGTH = 196K
+    BOOTLOADER_USR (rwx) : ORIGIN = 0x08000000, LENGTH =  32K
+    APP_USR        (rwx) : ORIGIN = 0x08004000, LENGTH = 192K
 
     /* Common memory regions */
     SYS    (rwx) : ORIGIN = 0x1FFF8000, LENGTH =  28K

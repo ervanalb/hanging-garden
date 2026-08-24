@@ -4,18 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-qingke-rt = { workspace = true }
-qingke = { workspace = true }
-ch32-metapac = { workspace = true }
-riscv = { workspace = true }
-critical-section = { workspace = true }
-portable-atomic = { workspace = true }
-fring = { workspace = true }
-heapless = { workspace = true }
-panic-halt = { workspace = true }
-embassy-executor = { workspace = true }
-embassy-futures = { workspace = true }
-embassy-sync = { workspace = true }
-embassy-time = { workspace = true }
-embassy-time-driver = { workspace = true }
-embassy-time-queue-utils = { workspace = true }
+qingke-rt = { version = "0.7", features = ["v4"] }
+qingke = { path = "../../../ch32-rs/qingke", version = "0.7" }
+ch32-metapac = { path = "../../../ch32-rs/ch32-metapac", features = ["ch32v203c8u6", "rt"] }
+riscv = "0.12"
+critical-section = "1.2"
+portable-atomic = { version = "1.9", features = ["critical-section"] }
+fring = { version = "0.5", features = ["portable-atomic"] }
+heapless = { version = "0.9" }
+panic-halt = "1.0"
+embassy-executor = { version = "0.10.0", features = ["platform-spin", "executor-thread"] }
+embassy-futures = "0.1.1"
+embassy-sync = "0.7.0"
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-time-driver = "0.2.0"
+embassy-time-queue-utils = "0.3.0"
+
+[profile.release]
+strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
+lto = true
+opt-level = 3
+
+[profile.dev]
+strip = false
+lto = true
+opt-level = 2

@@ -9,7 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 hal = { path = "../hal" }
-qingke-rt = { workspace = true }
-riscv = { workspace = true }
-embassy-executor = { workspace = true }
-embassy-time = { workspace = true }
+qingke-rt = { version = "0.7", features = ["v4"] }
+riscv = "0.12"
+embassy-executor = { version = "0.10.0", features = ["platform-spin", "executor-thread"] }
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+
+[profile.release]
+strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
+lto = true
+opt-level = 3
+
+[profile.dev]
+strip = false
+lto = true
+opt-level = 2
