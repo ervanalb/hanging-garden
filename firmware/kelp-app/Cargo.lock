@@ -472,6 +472,7 @@ dependencies = [
  "cobs",
  "crc",
  "embassy-executor",
+ "embassy-futures",
  "embassy-sync 0.8.0",
  "embassy-time",
  "fring",
@@ -480,6 +481,7 @@ dependencies = [
  "oorandom",
  "postcard",
  "qingke-rt",
+ "riscv 0.12.1",
  "serde",
  "static_cell",
 ]
