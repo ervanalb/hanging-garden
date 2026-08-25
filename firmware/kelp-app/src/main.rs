@@ -2,50 +2,193 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use embassy_time::Timer;
-use hal::{Hardware, Leds, UsartRx, UsartTx};
+use core::{cell::RefCell, ops::DerefMut};
+
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, watch::Watch};
+use embassy_time::{Duration, Instant, Timer, WithTimeout};
+use hal::{Hardware, Leds, UsartRx};
+use oorandom::Rand64;
+use serde::{Deserialize, Serialize};
+use static_cell::StaticCell;
 
 #[embassy_executor::task]
-async fn main_task(
-    mut leds: Leds,
-    mut north_tx: UsartTx,
-    mut south_tx: UsartTx,
-    mut east_tx: UsartTx,
-    mut west_tx: UsartTx,
-) {
+async fn main_task(mut leds: Leds) {
     loop {
         //println!("Tick");
         let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
-        north_tx.write(b"\0NORTH\0").await;
-        Timer::after_millis(10).await;
-        south_tx.write(b"\0SOUTH\0").await;
-        Timer::after_millis(10).await;
-        east_tx.write(b"\0EAST\0").await;
-        Timer::after_millis(10).await;
-        west_tx.write(b"\0WEST\0").await;
-        Timer::after_millis(10).await;
-
         Timer::after_millis(500).await;
-
         let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
-
         Timer::after_millis(500).await;
     }
 }
 
+static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
+
+#[derive(Serialize, Deserialize, Debug, PartialOrd, Ord, PartialEq, Eq, Clone)]
+struct CommState {}
+
+impl CommState {
+    fn is_consistent(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+fn try_decode_packet<'a>(s: &'a mut [u8]) -> postcard::Result<CommState> {
+    let sz = cobs::decode_in_place(s).map_err(|_| postcard::Error::DeserializeBadEncoding)?;
+    postcard::de_flavors::crc::from_bytes_u32(&s[..sz], CRC.digest())
+}
+
+const TRICKLE_IMIN: Duration = Duration::from_millis(100);
+const TRICKLE_IMAX: Duration = Duration::from_millis(10_000);
+const TRICKLE_K: usize = 1; // redundancy constant
+
+#[derive(Clone)]
+struct TrickleState {
+    comm_state: CommState,
+    interval: Duration,
+    counter: usize,
+    t_expiry: Instant,
+    interval_expiry: Instant,
+    after_t: bool,
+}
+
+impl TrickleState {
+    fn new(rng: impl DerefMut<Target = Rand64>) -> Self {
+        let mut result = TrickleState {
+            comm_state: CommState {},
+            interval: TRICKLE_IMIN,
+            counter: 0,
+            t_expiry: Instant::from_ticks(0), // set by `begin_interval()`
+            interval_expiry: Instant::from_ticks(0), // set by `begin_interval()`
+            after_t: false,
+        };
+        result.begin_interval(rng);
+        result
+    }
+
+    fn begin_interval(&mut self, mut rng: impl DerefMut<Target = Rand64>) {
+        let now = Instant::now();
+        self.counter = 0;
+        self.t_expiry = now
+            + Duration::from_ticks(
+                rng.rand_range(self.interval.as_ticks() / 2..self.interval.as_ticks()),
+            );
+        self.interval_expiry = now + self.interval;
+        self.after_t = false;
+    }
+
+    fn double_interval(&mut self) {
+        self.interval = Duration::from_ticks(self.interval.as_ticks() * 2).min(TRICKLE_IMAX);
+    }
+}
+
+static TRICKLE_STATE: StaticCell<Watch<NoopRawMutex, TrickleState, 2>> = StaticCell::new();
+static RNG: StaticCell<Mutex<NoopRawMutex, RefCell<Rand64>>> = StaticCell::new();
+
 #[embassy_executor::task(pool_size = 4)]
-async fn rx_task(_name: &'static str, mut usart_rx: UsartRx) {
+async fn rx_task(
+    _name: &'static str,
+    mut usart_rx: UsartRx,
+    state: &'static Watch<NoopRawMutex, TrickleState, 2>,
+    rng: &'static Mutex<NoopRawMutex, RefCell<Rand64>>,
+) {
+    let mut rx_buffer = heapless::Vec::<_, 1200>::new();
+    let mut overrun = false;
+
+    let mut state_receiver = state.anon_receiver();
+    let state_sender = state.sender();
+
     loop {
-        let region = usart_rx.read_until_zero().await;
-        if region.first().map(|&f| f == 0).unwrap_or(false) {
-            continue;
+        let start = rx_buffer.len();
+        let region = usart_rx.read(rx_buffer.capacity() - rx_buffer.len()).await;
+        rx_buffer.extend_from_slice(&region).unwrap();
+        // Look for end of frame (\0 byte)
+        for i in start..rx_buffer.len() {
+            if rx_buffer[i] == b'\0' {
+                // Decode slice if it is non-zero length and not overrun
+                if i > 0 && !overrun {
+                    // Deserialize rx_buffer[..i] into a CommState variable called packet
+                    if let Ok(received_comm_state) = try_decode_packet(&mut rx_buffer[..i]) {
+                        // We got a valid packet--update the state
+                        let mut current_state = state_receiver.try_get().unwrap();
+                        let rng_lock = rng.try_lock().unwrap();
+                        let rng = rng_lock.borrow_mut();
+                        if received_comm_state > current_state.comm_state {
+                            // Received message is new
+                            current_state.comm_state = received_comm_state;
+                            current_state.interval = TRICKLE_IMIN;
+                            current_state.begin_interval(rng);
+                            state_sender.send(current_state);
+                        } else if received_comm_state < current_state.comm_state {
+                            if !current_state.comm_state.is_consistent(&received_comm_state) {
+                                // Received message is outdated
+                                current_state.interval = TRICKLE_IMIN;
+                                current_state.begin_interval(rng);
+                                state_sender.send(current_state);
+                            } else {
+                                // Received message is consistent
+                            }
+                        } else {
+                            // Received message is redundant
+                            current_state.counter += 1;
+                            state_sender.send(current_state);
+                        }
+                    }
+                }
+                // Shift buffer contents left & clear overrun flag
+                rx_buffer.drain(..=i);
+                overrun = false;
+            }
         }
-        //println!(
-        //    "{} RX {:?} {:?}",
-        //    name,
-        //    &region[..],
-        //    core::str::from_utf8(&region[..])
-        //);
+        if rx_buffer.is_full() {
+            overrun = true;
+        }
+    }
+}
+
+#[embassy_executor::task(pool_size = 4)]
+async fn tx_task(
+    state: &'static Watch<NoopRawMutex, TrickleState, 2>,
+    rng: &'static Mutex<NoopRawMutex, RefCell<Rand64>>,
+) {
+    let mut state_receiver = state.receiver().unwrap();
+    let state_sender = state.sender();
+    loop {
+        let now = Instant::now();
+        let mut current_state = state_receiver.try_get().unwrap();
+
+        // Handle state transitions
+        if !current_state.after_t {
+            if now >= current_state.t_expiry {
+                // Handle timer expiry
+                current_state.after_t = true;
+                let counter = current_state.counter;
+                state_sender.send(current_state);
+
+                if counter < TRICKLE_K {
+                    // TODO: Propagate the current comm_state
+                    // Serialize each into 4 buffers
+                    // Simultaneously send out of the 4 ports (await)
+                }
+            } else {
+                let timeout = current_state.t_expiry - now;
+                let _ = state_receiver.changed().with_timeout(timeout).await;
+            }
+        } else {
+            if now >= current_state.interval_expiry {
+                current_state.double_interval();
+                {
+                    let rng_lock = rng.try_lock().unwrap();
+                    let rng = rng_lock.borrow_mut();
+                    current_state.begin_interval(rng);
+                }
+                state_sender.send(current_state);
+                continue;
+            } else {
+                let timeout = current_state.interval_expiry - now;
+                let _ = state_receiver.changed().with_timeout(timeout).await;
+            }
+        }
     }
 }
 
@@ -68,11 +211,22 @@ fn main() -> ! {
         EXECUTOR.write(executor)
     };
 
+    // TODO: Initialize with unique chip identifier
+    let rng: &'static Mutex<NoopRawMutex, RefCell<Rand64>> =
+        RNG.init(Mutex::new(RefCell::new(Rand64::new(0))));
+
+    let trickle_state = {
+        let rng_lock = rng.try_lock().unwrap();
+        let rng = rng_lock.borrow_mut();
+        TRICKLE_STATE.init(Watch::new_with(TrickleState::new(rng)))
+    };
+
     executor.run(|spawner| {
-        spawner.spawn(main_task(leds, north_tx, south_tx, east_tx, west_tx).unwrap());
-        spawner.spawn(rx_task("North", north_rx).unwrap());
-        spawner.spawn(rx_task("South", south_rx).unwrap());
-        spawner.spawn(rx_task("East", east_rx).unwrap());
-        spawner.spawn(rx_task("West", west_rx).unwrap());
+        spawner.spawn(main_task(leds).unwrap());
+        spawner.spawn(rx_task("North", north_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("South", south_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("East", east_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("West", west_rx, trickle_state, rng).unwrap());
+        spawner.spawn(tx_task(trickle_state, rng).unwrap());
     });
 }

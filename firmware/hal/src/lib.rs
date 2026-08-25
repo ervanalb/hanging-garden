@@ -213,7 +213,7 @@ impl Driver for SystickDriver {
 // LED and USART driver code
 // ============================================================================
 
-const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 1024;
+const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 1200;
 
 struct LedFrameBuffer {
     len: usize,

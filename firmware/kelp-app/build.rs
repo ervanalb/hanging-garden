@@ -10,8 +10,8 @@ fn main() {
     println!("cargo:rustc-link-search={}", out_dir.display());
 
     // Copy unified_memory.x from workspace root
-    fs::copy("../unified_memory.x", out_dir.join("unified_memory.x")).unwrap();
-    println!("cargo:rerun-if-changed=unified_memory.x");
+    fs::copy("../hal/unified_memory.x", out_dir.join("unified_memory.x")).unwrap();
+    println!("cargo:rerun-if-changed=../hal/unified_memory.x");
 
     // Copy app-specific linker script
     fs::copy("memory.x", out_dir.join("memory.x")).unwrap();
