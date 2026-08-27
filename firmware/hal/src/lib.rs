@@ -382,7 +382,7 @@ unsafe fn init_usart_halfduplex(
     dma_rx_channel: usize,
     rx_dma_buffer: &'static mut [u8],
 ) {
-    // Configure GPIO pin as alternate function push-pull
+    // Configure GPIO pin as alternate function
     if gpio_pin >= 8 {
         gpio_port.cfghr().modify(|w| {
             w.set_mode(gpio_pin - 8, Mode::OUTPUT_50MHZ);
@@ -397,7 +397,7 @@ unsafe fn init_usart_halfduplex(
 
     // Configure USART for half-duplex mode at 1 Mbaud
     // Baud rate = APB2_CLK / (16 * USARTDIV) = 144 MHz / (16 * 9) = 1 Mbaud
-    usart.brr().write_value(pac::usart::regs::Brr(9));
+    usart.brr().write_value(pac::usart::regs::Brr(9 << 3));
 
     usart.ctlr1().modify(|w| {
         w.set_m(false); // 8 data bits

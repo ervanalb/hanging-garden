@@ -1,0 +1,26 @@
+[package]
+name = "usb_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embassy-stm32 = { version = "0.1.0", features = ["stm32f042c6", "time-driver-any", "exti"] }
+embassy-executor = { version = "0.6.0", features = ["arch-cortex-m", "executor-thread", "integrated-timers"] }
+embassy-time = { version = "0.3.0" }
+embassy-usb = { version = "0.3.0" }
+embassy-futures = { version = "0.1.0" }
+
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+
+[profile.release]
+debug = true
+lto = true
+opt-level = "z"
+
+[profile.dev]
+debug = true
+opt-level = "s"

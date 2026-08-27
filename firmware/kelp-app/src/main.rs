@@ -79,15 +79,10 @@ impl TrickleState {
             after_t: false,
         };
         result.begin_interval(rng);
-        hal::println!("Constructing tricklestate: {:?}", result);
         result
     }
 
     fn begin_interval(&mut self, mut rng: impl DerefMut<Target = Rand64>) {
-        hal::println!(
-            "Begin interval called, t range={:?}",
-            self.interval.as_ticks() / 2..self.interval.as_ticks()
-        );
         let now = Instant::now();
         self.counter = 0;
         self.t_expiry = now
@@ -122,15 +117,17 @@ async fn rx_task(
     loop {
         let start = rx_buffer.len();
         let region = usart_rx.read(rx_buffer.capacity() - rx_buffer.len()).await;
+        hal::println!("RX from {} bytes: {:?}", name, &region[..]);
         rx_buffer.extend_from_slice(&region).unwrap();
         // Look for end of frame (\0 byte)
-        for i in start..rx_buffer.len() {
+        let mut i = start;
+        while i < rx_buffer.len() {
             if rx_buffer[i] == b'\0' {
                 // Decode slice if it is non-zero length and not overrun
                 if i > 0 && !overrun {
                     // Deserialize rx_buffer[..i] into a CommState variable called packet
                     if let Ok(received_comm_state) = try_decode_packet(&mut rx_buffer[..i]) {
-                        hal::println!("RX Packet from {}: {:?}", name, received_comm_state);
+                        hal::println!("RX from {}: packet {:?}", name, received_comm_state);
                         // We got a valid packet--update the state
                         let mut current_state = state_receiver.try_get().unwrap();
                         let rng_lock = rng.try_lock().unwrap();
@@ -160,6 +157,9 @@ async fn rx_task(
                 // Shift buffer contents left & clear overrun flag
                 rx_buffer.drain(..=i);
                 overrun = false;
+                i = 0;
+            } else {
+                i += 1;
             }
         }
         if rx_buffer.is_full() {
@@ -180,7 +180,6 @@ async fn tx_task(
     loop {
         let now = Instant::now();
         let mut current_state = state_receiver.try_get().unwrap();
-        hal::println!("TX loop. Current state is {:?}", current_state);
 
         // Handle state transitions
         if !current_state.after_t {
@@ -206,17 +205,14 @@ async fn tx_task(
                     // Would be nice to find a cleaner way to do this...
                     let [u0, u1, u2, u3] = &mut usarts_tx;
 
-                    // BROKEN?
-                    //join_array([
-                    //    u0.write(&tx_buffers[0][..lens[0]]),
-                    //    u1.write(&tx_buffers[1][..lens[1]]),
-                    //    u2.write(&tx_buffers[2][..lens[2]]),
-                    //    u3.write(&tx_buffers[3][..lens[3]]),
-                    //])
-                    //.await;
-                    hal::println!("SEND {:?}", &tx_buffers[0][..lens[0]]);
-                } else {
-                    hal::println!("no send");
+                    join_array([
+                        u0.write(&tx_buffers[0][..lens[0]]),
+                        u1.write(&tx_buffers[1][..lens[1]]),
+                        u2.write(&tx_buffers[2][..lens[2]]),
+                        u3.write(&tx_buffers[3][..lens[3]]),
+                    ])
+                    .await;
+                    hal::println!("TX {:?}", &tx_buffers[0][..lens[0]]);
                 }
             } else {
                 let timeout = current_state.t_expiry - now;
@@ -251,8 +247,6 @@ fn main() -> ! {
 
     led_pwr.set_pwr(true);
 
-    riscv::asm::delay(1_000_000); // XXX
-
     // Create executor
     let executor = embassy_executor::Executor::new();
     let executor = unsafe {
@@ -274,9 +268,9 @@ fn main() -> ! {
     executor.run(|spawner| {
         spawner.spawn(main_task(leds).unwrap());
         spawner.spawn(rx_task("North", north_rx, trickle_state, rng).unwrap());
-        //spawner.spawn(rx_task("South", south_rx, trickle_state, rng).unwrap());
-        //spawner.spawn(rx_task("East", east_rx, trickle_state, rng).unwrap());
-        //spawner.spawn(rx_task("West", west_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("South", south_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("East", east_rx, trickle_state, rng).unwrap());
+        spawner.spawn(rx_task("West", west_rx, trickle_state, rng).unwrap());
         spawner.spawn(tx_task(trickle_state, rng, usarts_tx).unwrap());
     });
 }
