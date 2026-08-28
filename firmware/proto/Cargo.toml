@@ -11,5 +11,6 @@ cobs = { version = "0.3", default-features = false }
 crc = "3.4"
 
 [features]
+default = ["app", "bl"]
 app = []
 bl = []
