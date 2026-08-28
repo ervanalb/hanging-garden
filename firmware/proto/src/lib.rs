@@ -1,9 +1,17 @@
 #![no_std]
 
 use serde::{Deserialize, Serialize};
-use trickle::{TrickleOrd, TrickleOrdering};
+use trickle::{TrickleOrd, TrickleOrdering, TrickleParams};
 
 static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
+
+pub const TRICKLE_PARAMS: TrickleParams = TrickleParams {
+    i_min_millis: 10,
+    i_max_millis: 10_000,
+    k: 1,
+};
+
+pub const MAX_PACKET_LEN: usize = 300;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CommState {}

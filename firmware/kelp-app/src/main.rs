@@ -5,9 +5,9 @@ use embassy_futures::join::join_array;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
 use hal::{Hardware, Leds, UsartRx, UsartTx};
-use proto::CommState;
+use proto::{CommState, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
-use trickle::{TrickleParams, TricklePollResult, TrickleState};
+use trickle::{TricklePollResult, TrickleState};
 
 static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
@@ -34,7 +34,7 @@ async fn rx_task(
     trickle_state: &'static Mutex<NoopRawMutex, TrickleState<'static, CommState>>,
     trickle_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
-    let mut rx_buffer = heapless::Vec::<_, 300>::new();
+    let mut rx_buffer = heapless::Vec::<_, MAX_PACKET_LEN>::new();
     let mut overrun = false;
 
     loop {
@@ -85,7 +85,7 @@ async fn tx_task(
     trickle_state: &'static Mutex<NoopRawMutex, TrickleState<'static, CommState>>,
     trickle_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
-    let mut tx_buffers: [_; 4] = core::array::from_fn(|_| [0_u8; 301]);
+    let mut tx_buffers: [_; 4] = core::array::from_fn(|_| [0_u8; MAX_PACKET_LEN + 1]);
     loop {
         let now = Instant::now();
 
@@ -133,12 +133,6 @@ async fn tx_task(
         }
     }
 }
-
-const TRICKLE_PARAMS: TrickleParams = TrickleParams {
-    i_min_millis: 100,
-    i_max_millis: 10_000,
-    k: 1,
-};
 
 #[qingke_rt::entry]
 fn main() -> ! {

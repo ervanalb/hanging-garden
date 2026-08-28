@@ -13,7 +13,6 @@ use embassy_time::Duration;
 #[cfg(feature = "impl-embassy")]
 use embassy_time::Instant;
 
-#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 #[derive(Debug)]
 pub struct TrickleParams {
     pub i_min_millis: u32,
