@@ -13,6 +13,8 @@ use embassy_time::Duration;
 #[cfg(feature = "impl-embassy")]
 use embassy_time::Instant;
 
+use core::cmp::Ordering;
+
 #[derive(Debug)]
 pub struct TrickleParams {
     pub i_min_millis: u32,
@@ -115,11 +117,11 @@ impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
     /// due to a potential change in timeout length.
     pub fn receive_state(&mut self, now: Instant, new_state: &S) -> bool {
         match self.state.consider(new_state) {
-            TrickleOrdering::Greater | TrickleOrdering::GreaterConsistent => {
+            TrickleOrdering::Greater => {
                 self.set_state(now, new_state);
                 true
             }
-            TrickleOrdering::Equal | TrickleOrdering::LessConsistent => {
+            TrickleOrdering::Consistent => {
                 self.counter += 1;
                 false
             }
@@ -147,13 +149,45 @@ impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
 }
 
 pub trait TrickleOrd {
+    /// Note that comparison cannot necessarily be reversed.
+    /// a.consider(b).reverse() is generally NOT the same as b.consider(a).
     fn consider(&self, other: &Self) -> TrickleOrdering;
 }
 
+#[repr(i8)]
 pub enum TrickleOrdering {
-    Greater,           // State is greater (e.g. fresher)
-    GreaterConsistent, // State is newer but consistent
-    Equal,
-    LessConsistent, // State is older but consistent
-    Less,           // State is lesser (e.g. outdated)
+    /// State is less and inconsistent (e.g. outdated)
+    Less = -1,
+    /// State is equal, or less but consistent
+    Consistent = 0,
+    /// State is greater (e.g. newer)
+    Greater = 1,
+}
+
+impl TrickleOrdering {
+    pub fn then(self, other: TrickleOrdering) -> TrickleOrdering {
+        match self {
+            Self::Less => Self::Less,
+            Self::Consistent => other,
+            Self::Greater => Self::Greater,
+        }
+    }
+
+    pub fn then_with<F: FnOnce() -> TrickleOrdering>(self, f: F) -> TrickleOrdering {
+        match self {
+            Self::Less => Self::Less,
+            Self::Consistent => f(),
+            Self::Greater => Self::Greater,
+        }
+    }
+}
+
+impl From<Ordering> for TrickleOrdering {
+    fn from(value: Ordering) -> Self {
+        match value {
+            Ordering::Less => Self::Less,
+            Ordering::Equal => Self::Consistent,
+            Ordering::Greater => Self::Greater,
+        }
+    }
 }
