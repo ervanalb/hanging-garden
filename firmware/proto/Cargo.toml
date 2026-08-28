@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+trickle = { path = "../trickle", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+postcard = { version = "1.0", features = ["use-crc"] }
+cobs = { version = "0.3", default-features = false }
+crc = "3.4"
 
 [features]
 app = []

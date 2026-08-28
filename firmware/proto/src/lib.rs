@@ -1,14 +1,37 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+#![no_std]
+
+use serde::{Deserialize, Serialize};
+use trickle::{TrickleOrd, TrickleOrdering};
+
+static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CommState {}
+
+impl TrickleOrd for CommState {
+    fn consider(&self, _other: &Self) -> trickle::TrickleOrdering {
+        TrickleOrdering::Equal
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl CommState {
+    pub fn propagate(&self) -> [Self; 4] {
+        core::array::from_fn(|_| CommState {})
+    }
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    pub fn try_deserialize_packet<'a>(s: &'a mut [u8]) -> postcard::Result<Self> {
+        let sz = cobs::decode_in_place(s).map_err(|_| postcard::Error::DeserializeBadEncoding)?;
+        postcard::de_flavors::crc::from_bytes_u32(&s[..sz], CRC.digest())
+    }
+
+    pub fn serialize_packet<'a>(self: &'a Self, s: &'a mut [u8]) -> &'a mut [u8] {
+        postcard::serialize_with_flavor(
+            self,
+            postcard::ser_flavors::crc::CrcModifier::new(
+                postcard::ser_flavors::Cobs::try_new(postcard::ser_flavors::Slice::new(s)).unwrap(),
+                CRC.digest(),
+            ),
+        )
+        .unwrap()
     }
 }

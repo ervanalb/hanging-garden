@@ -1,5 +1,19 @@
+#![cfg_attr(not(feature = "impl-std"), no_std)]
+
+#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 use oorandom::Rand32;
 
+#[cfg(feature = "impl-std")]
+use std::time::Duration;
+#[cfg(feature = "impl-std")]
+use std::time::Instant;
+
+#[cfg(feature = "impl-embassy")]
+use embassy_time::Duration;
+#[cfg(feature = "impl-embassy")]
+use embassy_time::Instant;
+
+#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 #[derive(Debug)]
 pub struct TrickleParams {
     pub i_min_millis: u32,
@@ -7,13 +21,9 @@ pub struct TrickleParams {
     pub k: u32,
 }
 
-pub trait TrickleInstant: Copy + PartialOrd {
-    fn plus_millis(self, millis: u32) -> Self;
-    fn millis_until(self, other: Self) -> u32;
-}
-
+#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 #[derive(Clone, Debug)]
-pub struct TrickleState<'a, S, Instant> {
+pub struct TrickleState<'a, S> {
     params: &'a TrickleParams,
     rng: Rand32,
     state: S,
@@ -24,6 +34,7 @@ pub struct TrickleState<'a, S, Instant> {
     after_t: bool,
 }
 
+#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 pub enum TricklePollResult {
     /// Data should be broadcast out immediately
     Send,
@@ -32,7 +43,8 @@ pub enum TricklePollResult {
     Wait(u32),
 }
 
-impl<'a, S: Default + Clone + TrickleOrd, Instant: TrickleInstant> TrickleState<'a, S, Instant> {
+#[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
+impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
     pub fn new(params: &'a TrickleParams, now: Instant, rng_seed: u64) -> Self {
         let mut result = TrickleState {
             params,
@@ -51,11 +63,13 @@ impl<'a, S: Default + Clone + TrickleOrd, Instant: TrickleInstant> TrickleState<
     fn begin_interval(&mut self, now: Instant) {
         self.counter = 0;
 
-        self.t_expiry = now.plus_millis(
-            self.rng
-                .rand_range(self.interval_millis / 2..self.interval_millis),
-        );
-        self.interval_expiry = now.plus_millis(self.interval_millis);
+        self.t_expiry = now
+            + Duration::from_millis(
+                self.rng
+                    .rand_range(self.interval_millis / 2..self.interval_millis)
+                    as u64,
+            );
+        self.interval_expiry = now + Duration::from_millis(self.interval_millis as u64);
         self.after_t = false;
     }
 
@@ -77,28 +91,29 @@ impl<'a, S: Default + Clone + TrickleOrd, Instant: TrickleInstant> TrickleState<
                 if self.counter < self.params.k {
                     TricklePollResult::Send
                 } else {
-                    let timeout = now.millis_until(self.interval_expiry);
+                    let timeout = (self.interval_expiry - now).as_millis() as u32;
                     TricklePollResult::Wait(timeout)
                 }
             } else {
-                let timeout = now.millis_until(self.t_expiry);
+                let timeout = (self.t_expiry - now).as_millis() as u32;
                 TricklePollResult::Wait(timeout)
             }
         } else {
             if now >= self.interval_expiry {
                 self.double_interval();
                 self.begin_interval(now);
-                let timeout = now.millis_until(self.t_expiry);
+                let timeout = (self.t_expiry - now).as_millis() as u32;
                 TricklePollResult::Wait(timeout)
             } else {
-                let timeout = now.millis_until(self.interval_expiry);
+                let timeout = (self.interval_expiry - now).as_millis() as u32;
                 TricklePollResult::Wait(timeout)
             }
         }
     }
 
     /// Merge in a new state that we have received, and update the trickle algorithm accordingly.
-    /// Returns whether the new state was accepted.
+    /// Returns whether the trickle loop should be woken
+    /// due to a potential change in timeout length.
     pub fn receive_state(&mut self, now: Instant, new_state: &S) -> bool {
         match self.state.consider(new_state) {
             TrickleOrdering::Greater | TrickleOrdering::GreaterConsistent => {
@@ -115,7 +130,7 @@ impl<'a, S: Default + Clone + TrickleOrd, Instant: TrickleInstant> TrickleState<
                 // to bring our neighbor up to date.
                 self.reset_interval();
                 self.begin_interval(now);
-                false
+                true
             }
         }
     }

@@ -3,5 +3,11 @@ name = "trickle"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["impl-std"]
+impl-std = []
+impl-embassy = ["embassy-time"]
+
 [dependencies]
 oorandom = "11.1.5"
+embassy-time = { version = "0.5", optional = true }
