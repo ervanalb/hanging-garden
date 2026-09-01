@@ -27,13 +27,17 @@ unsafe extern "C" {
     static _sflash: ();
 }
 
+pub static mut PRINTLN: bool = false;
+
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    riscv::asm::delay(1_000_000);
-    use crate::println;
-    println!("*** PANIC ***");
-    println!("{}", info);
+    if unsafe { PRINTLN } {
+        riscv::asm::delay(1_000_000);
+        use crate::println;
+        println!("*** PANIC ***");
+        println!("{}", info);
+    }
     loop {}
 }
 
@@ -71,10 +75,12 @@ impl core::fmt::Write for SDIPrint {
 macro_rules! println {
     ($($arg:tt)*) => {
         {
-            use core::fmt::Write;
-            use core::writeln;
+            if unsafe { $crate::PRINTLN } {
+                use core::fmt::Write;
+                use core::writeln;
 
-            writeln!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
+                writeln!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
+            }
         }
     }
 }
@@ -83,10 +89,12 @@ macro_rules! println {
 macro_rules! print {
     ($($arg:tt)*) => {
         {
-            use core::fmt::Write;
-            use core::write;
+            if unsafe { $crate::PRINTLN } {
+                use core::fmt::Write;
+                use core::write;
 
-            write!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
+                write!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
+            }
         }
     }
 }
@@ -213,7 +221,7 @@ impl Driver for SystickDriver {
 // LED and USART driver code
 // ============================================================================
 
-const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 1200;
+const LED_FRAME_BUFFER_MAX_DATA_COUNT: usize = 600;
 
 struct LedFrameBuffer {
     len: usize,
@@ -284,7 +292,7 @@ static USART3_RX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART4_RX_WAKER: AtomicWaker = AtomicWaker::new();
 
 // USART RX circular DMA buffers
-const USART_RX_DMA_BUFFER_SIZE: usize = 64;
+const USART_RX_DMA_BUFFER_SIZE: usize = 512;
 static mut USART1_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 static mut USART2_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 static mut USART3_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
@@ -537,7 +545,11 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    pub fn init() -> Self {
+    pub fn init(println: bool) -> Self {
+        unsafe {
+            PRINTLN = println;
+        }
+
         // Configure system clock to 144 MHz from HSI
         // HSI = 8 MHz, PLL = HSI * 18 = 144 MHz
         // Enable HSI

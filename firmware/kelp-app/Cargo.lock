@@ -402,7 +402,7 @@ dependencies = [
  "heapless 0.9.3",
  "panic-halt",
  "portable-atomic",
- "qingke 0.7.0",
+ "qingke",
  "qingke-rt",
  "riscv 0.12.1",
 ]
@@ -456,6 +456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32 0.3.1",
+ "serde_core",
  "stable_deref_trait",
 ]
 
@@ -469,21 +470,15 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 name = "kelp-app"
 version = "0.1.0"
 dependencies = [
- "cobs",
- "crc",
  "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.8.0",
  "embassy-time",
- "fring",
  "hal",
  "heapless 0.9.3",
- "oorandom",
- "postcard",
  "proto",
+ "qingke",
  "qingke-rt",
- "riscv 0.12.1",
- "serde",
  "static_cell",
  "trickle",
 ]
@@ -663,6 +658,8 @@ version = "0.1.0"
 dependencies = [
  "cobs",
  "crc",
+ "embassy-time",
+ "heapless 0.9.3",
  "postcard",
  "serde",
  "trickle",
@@ -674,17 +671,6 @@ version = "0.7.0"
 dependencies = [
  "bit_field",
  "cfg-if",
- "riscv 0.15.0",
-]
-
-[[package]]
-name = "qingke"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6e6adbd788587b2f0893d36ef8dd1eb9e7f9b7a32678e9b43149df1880575a"
-dependencies = [
- "bit_field",
- "cfg-if",
  "critical-section",
  "riscv 0.15.0",
 ]
@@ -692,18 +678,14 @@ dependencies = [
 [[package]]
 name = "qingke-rt"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3f5debfcb74752c0949a1f2700e5c98a34ae06174b6551034d99de0d12f13c"
 dependencies = [
- "qingke 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "qingke",
  "qingke-rt-macros",
 ]
 
 [[package]]
 name = "qingke-rt-macros"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e26f9a1d7490c8c7e75ef095511c8b146a2958f27e4e3e9d3ce2411d948f07ff"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",

@@ -17,18 +17,17 @@ use core::cmp::Ordering;
 
 #[derive(Debug)]
 pub struct TrickleParams {
-    pub i_min_millis: u32,
-    pub i_max_millis: u32,
+    pub i_min_micros: u64,
+    pub i_max_micros: u64,
     pub k: u32,
 }
 
 #[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
 #[derive(Clone, Debug)]
-pub struct TrickleState<'a, S> {
+pub struct TrickleState<'a> {
     params: &'a TrickleParams,
     rng: Rand32,
-    state: S,
-    interval_millis: u32,
+    interval_micros: u64,
     counter: u32,
     t_expiry: Instant,
     interval_expiry: Instant,
@@ -39,19 +38,18 @@ pub struct TrickleState<'a, S> {
 pub enum TricklePollResult {
     /// Data should be broadcast out immediately
     Send,
-    /// Timeout in milliseconds with how long until poll should be called again
+    /// Timeout in microseconds with how long until poll should be called again
     /// (max time to wait--can be called sooner.)
-    Wait(u32),
+    Wait(u64),
 }
 
 #[cfg(any(feature = "impl-std", feature = "impl-embassy"))]
-impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
+impl<'a> TrickleState<'a> {
     pub fn new(params: &'a TrickleParams, now: Instant, rng_seed: u64) -> Self {
         let mut result = TrickleState {
             params,
             rng: Rand32::new(rng_seed),
-            state: S::default(),
-            interval_millis: params.i_min_millis,
+            interval_micros: params.i_min_micros,
             counter: 0,
             t_expiry: now,        // set by `begin_interval()`
             interval_expiry: now, // set by `begin_interval()`
@@ -64,22 +62,24 @@ impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
     fn begin_interval(&mut self, now: Instant) {
         self.counter = 0;
 
-        self.t_expiry = now
-            + Duration::from_millis(
-                self.rng
-                    .rand_range(self.interval_millis / 2..self.interval_millis)
-                    as u64,
-            );
-        self.interval_expiry = now + Duration::from_millis(self.interval_millis as u64);
+        // Divide down to approximately milliseconds to avoid having to keep around a 64-bit RNG.
+        // All rounding is towards zero, so this may generate a t value which is
+        // slightly below I / 2 (ok) but never above I (would be bad.)
+        let interval_millis_ish = (self.interval_micros / 1024) as u32;
+        let t_millis_ish =
+            self.rng
+                .rand_range(interval_millis_ish / 2..interval_millis_ish) as u64;
+        self.t_expiry = now + Duration::from_micros(t_millis_ish as u64 * 1024);
+        self.interval_expiry = now + Duration::from_micros(self.interval_micros);
         self.after_t = false;
     }
 
     fn double_interval(&mut self) {
-        self.interval_millis = (self.interval_millis * 2).min(self.params.i_max_millis);
+        self.interval_micros = (self.interval_micros * 2).min(self.params.i_max_micros);
     }
 
     fn reset_interval(&mut self) {
-        self.interval_millis = self.params.i_min_millis;
+        self.interval_micros = self.params.i_min_micros;
     }
 
     /// Advance the trickle algorithm.
@@ -92,59 +92,44 @@ impl<'a, S: Default + Clone + TrickleOrd> TrickleState<'a, S> {
                 if self.counter < self.params.k {
                     TricklePollResult::Send
                 } else {
-                    let timeout = (self.interval_expiry - now).as_millis() as u32;
+                    let timeout = (self.interval_expiry - now).as_micros() as u64;
                     TricklePollResult::Wait(timeout)
                 }
             } else {
-                let timeout = (self.t_expiry - now).as_millis() as u32;
+                let timeout = (self.t_expiry - now).as_micros() as u64;
                 TricklePollResult::Wait(timeout)
             }
         } else {
             if now >= self.interval_expiry {
                 self.double_interval();
                 self.begin_interval(now);
-                let timeout = (self.t_expiry - now).as_millis() as u32;
+                let timeout = (self.t_expiry - now).as_micros() as u64;
                 TricklePollResult::Wait(timeout)
             } else {
-                let timeout = (self.interval_expiry - now).as_millis() as u32;
+                let timeout = (self.interval_expiry - now).as_micros() as u64;
                 TricklePollResult::Wait(timeout)
             }
         }
     }
 
-    /// Merge in a new state that we have received, and update the trickle algorithm accordingly.
-    /// Returns whether the trickle loop should be woken
-    /// due to a potential change in timeout length.
-    pub fn receive_state(&mut self, now: Instant, new_state: &S) -> bool {
-        match self.state.consider(new_state) {
-            TrickleOrdering::Greater => {
-                self.set_state(now, new_state);
-                true
-            }
-            TrickleOrdering::Consistent => {
-                self.counter += 1;
-                false
-            }
-            TrickleOrdering::Less => {
-                // Receiving an outdated state that is not consistent
-                // means we should broadcast out again soon,
-                // to bring our neighbor up to date.
-                self.reset_interval();
-                self.begin_interval(now);
-                true
-            }
-        }
-    }
-
-    /// Set a new state and update the trickle algorithm accordingly.
-    pub fn set_state(&mut self, now: Instant, new_state: &S) {
-        self.state = new_state.clone();
+    /// Takes appropriate trickle actions given that we are assuming newer state.
+    /// The polling loop should be woken.
+    pub fn got_new_state(&mut self, now: Instant) {
         self.reset_interval();
         self.begin_interval(now);
     }
 
-    pub fn state(&self) -> &S {
-        &self.state
+    /// Takes appropriate trickle actions given that we received a consistent (redundant) state.
+    /// (The polling loop does not need to be woken.)
+    pub fn got_consistent_state(&mut self) {
+        self.counter += 1;
+    }
+
+    /// Takes appropriate trickle actions given that we received an outdated state.
+    /// The polling loop should be woken.
+    pub fn got_outdated_state(&mut self, now: Instant) {
+        self.reset_interval();
+        self.begin_interval(now);
     }
 }
 
@@ -180,6 +165,22 @@ impl TrickleOrdering {
             Self::Greater => Self::Greater,
         }
     }
+
+    /*
+    pub fn max(cmp: Ordering) -> TrickleOrdering {
+        match cmp {
+            Ordering::Less | Ordering::Equal => Self::Consistent,
+            Ordering::Greater => Self::Greater,
+        }
+    }
+
+    pub fn min(cmp: Ordering) -> TrickleOrdering {
+        match cmp {
+            Ordering::Greater | Ordering::Equal => Self::Consistent,
+            Ordering::Less => Self::Greater,
+        }
+    }
+    */
 }
 
 impl From<Ordering> for TrickleOrdering {

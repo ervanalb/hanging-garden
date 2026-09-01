@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-qingke-rt = { version = "0.7", features = ["v4"] }
+qingke-rt = { path = "../../../ch32-rs/qingke/qingke-rt", version = "0.7", features = ["v4"] }
 qingke = { path = "../../../ch32-rs/qingke", version = "0.7" }
 ch32-metapac = { path = "../../../ch32-rs/ch32-metapac", features = ["ch32v203c8u6", "rt"] }
 riscv = "0.12"

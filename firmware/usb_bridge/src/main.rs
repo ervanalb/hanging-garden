@@ -1,16 +1,13 @@
 #![no_std]
 #![no_main]
 
-use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
-use embassy_stm32::usart::{Config as UsartConfig, Uart};
+use embassy_stm32::usart::{Config as UsartConfig, RingBufferedUartRx, UartTx};
 use embassy_stm32::usb::{Driver, Instance};
 use embassy_stm32::{bind_interrupts, peripherals, usb};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_usb::driver::EndpointError;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::Builder;
-use {defmt_rtt as _, panic_probe as _};
+extern crate panic_halt;
 
 bind_interrupts!(struct Irqs {
     USB => usb::InterruptHandler<peripherals::USB>;
@@ -20,7 +17,6 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
-    info!("USB-UART Bridge starting...");
 
     // Create USB driver
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
@@ -47,15 +43,15 @@ async fn main(_spawner: Spawner) {
     );
 
     // Create CDC-ACM class
-    let mut cdc_class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut state, 64);
 
     // Build the USB device
     let mut usb = builder.build();
 
-    // Configure USART1 for half-duplex at 1 MBaud
+    // Configure USART1 for half-duplex at 1 MBaud with ring-buffered RX
     let mut uart_config = UsartConfig::default();
     uart_config.baudrate = 1_000_000; // 1 MBaud
-    let mut uart = Uart::new_half_duplex(
+    let uart = embassy_stm32::usart::Uart::new_half_duplex(
         p.USART1,
         p.PB6, // TX pin (also used for RX in half-duplex)
         Irqs,
@@ -65,7 +61,15 @@ async fn main(_spawner: Spawner) {
     )
     .unwrap();
 
-    info!("USB and UART initialized");
+    // Split UART into TX and RX parts for ring buffering
+    let (mut uart_tx, uart_rx) = uart.split();
+
+    // Create ring buffer for RX (256 byte buffer)
+    static mut UART_RX_RING_BUF: [u8; 256] = [0u8; 256];
+    let mut uart_rx = uart_rx.into_ring_buffered(unsafe { &mut UART_RX_RING_BUF });
+
+    // Split USB CDC class into RX and TX
+    let (mut usb_tx, mut usb_rx) = cdc_class.split();
 
     // Run USB device
     let usb_fut = usb.run();
@@ -73,10 +77,8 @@ async fn main(_spawner: Spawner) {
     // Bidirectional bridge task
     let bridge_fut = async {
         loop {
-            cdc_class.wait_connection().await;
-            info!("USB Connected");
-            let _ = bidirectional_bridge(&mut cdc_class, &mut uart).await;
-            info!("USB Disconnected");
+            usb_rx.wait_connection().await;
+            bidirectional_bridge(&mut usb_tx, &mut usb_rx, &mut uart_tx, &mut uart_rx).await;
         }
     };
 
@@ -84,55 +86,36 @@ async fn main(_spawner: Spawner) {
     embassy_futures::join::join(usb_fut, bridge_fut).await;
 }
 
-struct Disconnected {}
-
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => {
-                warn!("USB Buffer overflow");
-                Disconnected {}
-            }
-            EndpointError::Disabled => Disconnected {},
-        }
-    }
-}
-
 // Bidirectional bridge between USB and UART
 async fn bidirectional_bridge<'d, T: Instance + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
-    uart: &mut Uart<'d, peripherals::USART1, peripherals::DMA1_CH2, peripherals::DMA1_CH3>,
-) -> Result<(), Disconnected> {
-    let mut usb_buf = [0; 64];
-    let mut uart_buf = [0; 64];
+    usb_tx: &mut Sender<'d, Driver<'d, T>>,
+    usb_rx: &mut Receiver<'d, Driver<'d, T>>,
+    uart_tx: &mut UartTx<'d, peripherals::USART1, peripherals::DMA1_CH2>,
+    uart_rx: &mut RingBufferedUartRx<'d, peripherals::USART1, peripherals::DMA1_CH3>,
+) {
+    // USB -> UART direction
+    let usb_to_uart = async {
+        let mut buf = [0; 64];
+        loop {
+            let Ok(n) = usb_rx.read_packet(&mut buf).await else {
+                break;
+            };
+            let data = &buf[..n];
+            if let Err(_e) = uart_tx.write(data).await {}
+        }
+    };
 
-    loop {
-        // Use select to handle both directions concurrently
-        match select(
-            class.read_packet(&mut usb_buf),
-            uart.read_until_idle(&mut uart_buf),
-        )
-        .await
-        {
-            Either::First(result) => {
-                // Data received from USB, send to UART
-                let n = result?;
-                let data = &usb_buf[..n];
-                if let Err(_e) = uart.write(data).await {
-                    warn!("UART write error");
-                }
-            }
-            Either::Second(result) => {
-                // Data received from UART, send to USB
-                if let Ok(n) = result {
-                    let data = &uart_buf[..n];
-                    if let Err(_e) = class.write_packet(data).await {
-                        warn!("USB write error");
-                    }
-                } else {
-                    warn!("UART read error");
-                }
+    // UART -> USB direction
+    let uart_to_usb = async {
+        let mut buf = [0; 64];
+        loop {
+            if let Ok(n) = uart_rx.read(&mut buf).await {
+                let data = &buf[..n];
+                if let Err(_e) = usb_tx.write_packet(data).await {}
             }
         }
-    }
+    };
+
+    // Run both directions concurrently
+    embassy_futures::join::join(usb_to_uart, uart_to_usb).await;
 }
