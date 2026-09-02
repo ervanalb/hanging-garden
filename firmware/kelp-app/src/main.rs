@@ -187,6 +187,7 @@ fn main() -> ! {
         mut led_pwr,
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
+        flash: _,
     } = Hardware::init(false);
 
     led_pwr.set_pwr(true);

@@ -23,3 +23,7 @@ MEMORY
 
 PROVIDE(_sbootloader = ORIGIN(BOOTLOADER_FLASH));
 PROVIDE(_sapp = ORIGIN(APP_FLASH));
+
+/* Set bounds of writable flash */
+PROVIDE(_susr = ORIGIN(BOOTLOADER_USR));
+PROVIDE(_eusr = ORIGIN(APP_USR) + LENGTH(APP_USR));

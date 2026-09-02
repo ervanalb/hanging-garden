@@ -25,6 +25,8 @@ unsafe extern "C" {
     static _sbootloader: ();
     static _sapp: ();
     static _sflash: ();
+    static _susr: ();
+    static _eusr: ();
 }
 
 pub static mut PRINTLN: bool = false;
@@ -404,8 +406,7 @@ unsafe fn init_usart_halfduplex(
     }
 
     // Configure USART for half-duplex mode at 1 Mbaud
-    // Baud rate = APB2_CLK / (16 * USARTDIV) = 144 MHz / (16 * 9) = 1 Mbaud
-    usart.brr().write_value(pac::usart::regs::Brr(9 << 3));
+    usart.brr().write_value(pac::usart::regs::Brr(60));
 
     usart.ctlr1().modify(|w| {
         w.set_m(false); // 8 data bits
@@ -542,6 +543,7 @@ pub struct Hardware {
     pub led_pwr: LedPwr,
     pub usarts_tx: [UsartTx; 4],
     pub usarts_rx: [UsartRx; 4],
+    pub flash: Flash,
 }
 
 impl Hardware {
@@ -550,16 +552,16 @@ impl Hardware {
             PRINTLN = println;
         }
 
-        // Configure system clock to 144 MHz from HSI
-        // HSI = 8 MHz, PLL = HSI * 18 = 144 MHz
+        // Configure system clock to 120 MHz from HSI
+        // HSI = 8 MHz, PLL = HSI * 15 = 120 MHz
         // Enable HSI
         pac::RCC.ctlr().modify(|w| w.set_hsion(true));
         while !pac::RCC.ctlr().read().hsirdy() {}
 
-        // Configure main PLL: HSI * 18 = 144 MHz
+        // Configure main PLL: HSI * 15 = 120 MHz
         pac::RCC.cfgr0().modify(|w| {
             w.set_pllsrc(false); // HSI as PLL source
-            w.set_pllmul(PllMul::MUL18); // PLL multiplier x18
+            w.set_pllmul(PllMul::MUL15); // PLL multiplier x15
         });
 
         // Configure bus prescalers (all DIV1)
@@ -586,9 +588,9 @@ impl Hardware {
             );
         }
 
-        // Initialize embassy time driver with SysTick (HCLK = 144 MHz)
+        // Initialize embassy time driver with SysTick (HCLK = 120 MHz)
         critical_section::with(|cs| {
-            TIME_DRIVER.init(cs, 144_000_000);
+            TIME_DRIVER.init(cs, 120_000_000);
         });
 
         // Enable peripheral clocks
@@ -636,13 +638,13 @@ impl Hardware {
             w.set_spi1_rm(true);
         });
 
-        // APB2 = 144 MHz, desired SPI clock = 3.2 MHz
-        // 144 MHz / 32 / 2 = 2.25 MHz (closest to 3.2 MHz)
+        // APB2 = 120 MHz, desired SPI clock = 3.2 MHz
+        // 120 MHz / 16 / 2 = 3.75 MHz (closest to 3.2 MHz)
         pac::SPI1.ctlr1().modify(|w| {
             w.set_cpha(false); // Clock phase: first edge
             w.set_cpol(false); // Clock polarity: low when idle
             w.set_mstr(true); // Master mode
-            w.set_br(BaudRate::DIV_32); // Baud rate: APB2/64 = 2.25 MHz
+            w.set_br(BaudRate::DIV_16); // Baud rate
             w.set_spe(false); // SPI disabled during configuration
             w.set_lsbfirst(false); // MSB first
             w.set_ssi(true); // Internal slave select high
@@ -808,6 +810,7 @@ impl Hardware {
                     waker: &USART2_RX_WAKER,
                 },
             ],
+            flash: Flash {},
         }
     }
 }
@@ -1231,5 +1234,165 @@ pub unsafe fn branch_to_app() -> ! {
 pub unsafe fn branch_to_bootloader() -> ! {
     unsafe {
         branch(&_sbootloader);
+    }
+}
+
+// ============================================================================
+// Flash memory operations
+// ============================================================================
+
+pub struct Flash {}
+
+impl Flash {
+    /// Write a page of flash memory (up to 256 bytes) using fast erase and fast programming modes
+    ///
+    /// This function uses:
+    /// - Fast page erase (FTER) - 256 bytes
+    /// - Fast page programming (FTPG) - 256 bytes
+    ///
+    /// # Arguments
+    /// * `address` - The target flash address (must be 256-byte aligned)
+    /// * `data` - The data to write (must be up to 256 bytes)
+    ///
+    /// # Panics
+    /// Panics if:
+    /// - The address is not 256-byte aligned
+    /// - The data size exceeds 256 bytes
+    /// - Flash is write protected
+    #[inline(never)] // XXX
+    pub fn write_page(&mut self, address: u32, data: &[u8]) {
+        // Validate inputs
+        let susr = unsafe { (&_susr as *const ()) as u32 };
+        let eusr = unsafe { (&_eusr as *const ()) as u32 };
+        assert!(
+            address >= susr && address < eusr,
+            "Flash address out of bounds"
+        );
+        assert!(address % 256 == 0, "Flash address must be 256-byte aligned");
+        assert!(
+            data.len() <= 256,
+            "Flash write data size must be <= 256 bytes"
+        );
+
+        if data.is_empty() {
+            return;
+        }
+
+        critical_section::with(|_cs| unsafe {
+            // Check LOCK bit and unlock if needed
+            if pac::FLASH.ctlr().read().lock() {
+                pac::FLASH.keyr().write(|w| w.set_keyr(0x4567_0123));
+                compiler_fence(Ordering::SeqCst);
+                pac::FLASH.keyr().write(|w| w.set_keyr(0xCDEF_89AB));
+                compiler_fence(Ordering::SeqCst);
+            }
+            assert!(!pac::FLASH.ctlr().read().lock(), "Unlock failed");
+
+            // Check FLOCK bit and unlock fast programming mode if needed
+            if pac::FLASH.ctlr().read().flock() {
+                pac::FLASH.modekeyr().write(|w| w.set_modekeyr(0x4567_0123));
+                compiler_fence(Ordering::SeqCst);
+                pac::FLASH.modekeyr().write(|w| w.set_modekeyr(0xCDEF_89AB));
+                compiler_fence(Ordering::SeqCst);
+            }
+            assert!(!pac::FLASH.ctlr().read().flock(), "Fast unlock failed");
+
+            // Wait for BSY bit to confirm no operations in progress
+            while pac::FLASH.statr().read().bsy() {}
+            compiler_fence(Ordering::SeqCst);
+            assert!(
+                !pac::FLASH.statr().read().wrprterr(),
+                "Flash is write protected"
+            );
+            compiler_fence(Ordering::SeqCst);
+
+            // ========== FAST PAGE ERASE (256 bytes) ==========
+            // Set FTER bit to enable fast page erase mode
+            pac::FLASH.ctlr().modify(|w| w.set_page_er(true));
+
+            // Write the first address of the page to FLASH_ADDR
+            pac::FLASH.addr().write(|w| w.set_far(address));
+            compiler_fence(Ordering::SeqCst);
+
+            // Set STRT bit to start fast page erase
+            pac::FLASH.ctlr().modify(|w| w.set_strt(true));
+            compiler_fence(Ordering::SeqCst);
+
+            // Wait for BSY bit to become 0
+            while pac::FLASH.statr().read().bsy() {}
+            compiler_fence(Ordering::SeqCst);
+            assert!(
+                !pac::FLASH.statr().read().wrprterr(),
+                "Flash is write protected"
+            );
+            compiler_fence(Ordering::SeqCst);
+
+            // Check EOP and clear it
+            assert!(
+                pac::FLASH.statr().read().eop(),
+                "Flash erase did not complete. statr={:#010x}",
+                pac::FLASH.statr().read().0
+            );
+            compiler_fence(Ordering::SeqCst);
+            pac::FLASH.statr().modify(|w| w.set_eop(true));
+
+            // Clear FTER bit when erasing ends
+            pac::FLASH.ctlr().modify(|w| w.set_page_er(false));
+
+            // ========== FAST PAGE PROGRAMMING (256 bytes) ==========
+            // Set FTPG bit to enable fast page programming mode
+            pac::FLASH.ctlr().modify(|w| w.set_page_pg(true));
+            compiler_fence(Ordering::SeqCst);
+
+            // Write data in 4-byte chunks (up to 64 times for 256 bytes)
+            let mut addr = address;
+
+            for word_chunk in data.chunks(4) {
+                // Pad the last chunk with 0xFF if needed
+                let mut word_bytes = [0xFF_u8; 4];
+                word_bytes[..word_chunk.len()].copy_from_slice(word_chunk);
+                let word = u32::from_le_bytes(word_bytes);
+
+                // Write 32-bit data to flash address
+                core::ptr::write_volatile(addr as *mut u32, word);
+                addr += 4;
+                compiler_fence(Ordering::SeqCst);
+
+                // Wait for WR_BSY to become 0
+                while pac::FLASH.statr().read().wr_bsy() {}
+                compiler_fence(Ordering::SeqCst);
+            }
+
+            // Set PG_START bit to start fast page programming
+            pac::FLASH.ctlr().modify(|w| w.set_pgstart(true));
+            compiler_fence(Ordering::SeqCst);
+
+            // Wait for BSY bit to become 0
+            while pac::FLASH.statr().read().bsy() {}
+            compiler_fence(Ordering::SeqCst);
+            assert!(
+                !pac::FLASH.statr().read().wrprterr(),
+                "Flash is write protected"
+            );
+            compiler_fence(Ordering::SeqCst);
+
+            // Check EOP and clear it
+            assert!(
+                pac::FLASH.statr().read().eop(),
+                "Flash programming did not complete"
+            );
+            compiler_fence(Ordering::SeqCst);
+            pac::FLASH.statr().modify(|w| w.set_eop(true));
+
+            // Unclear if FTPG/BTPG bit is cleared automatically.
+            pac::FLASH.ctlr().modify(|w| w.set_page_pg(false));
+            compiler_fence(Ordering::SeqCst);
+
+            // Lock the flash
+            pac::FLASH.ctlr().modify(|w| {
+                w.set_lock(true);
+                w.set_flock(true);
+            });
+        })
     }
 }

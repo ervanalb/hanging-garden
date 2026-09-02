@@ -4,7 +4,7 @@
 use embassy_futures::join::join_array;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Hardware, UsartRx, UsartTx};
+use hal::{Flash, Hardware, UsartRx, UsartTx};
 use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
@@ -17,11 +17,13 @@ static STATE: StaticCell<(
     Signal<NoopRawMutex, ()>,
     Mutex<NoopRawMutex, bool>,
     Mutex<NoopRawMutex, BlState>,
+    Mutex<NoopRawMutex, Flash>,
 )> = StaticCell::new();
 
 enum BlState {
     Init,
     Ping(u64),
+    CodeWrite(u32),
 }
 
 #[embassy_executor::task]
@@ -53,6 +55,7 @@ async fn rx_task(
     trickle_signal: &'static Signal<NoopRawMutex, ()>,
     did_receive_packet: &'static Mutex<NoopRawMutex, bool>,
     bl_state: &'static Mutex<NoopRawMutex, BlState>,
+    flash: &'static Mutex<NoopRawMutex, Flash>,
 ) {
     let mut rx_buffer = heapless::Vec::<_, MAX_PACKET_LEN>::new();
     let mut overrun = false;
@@ -72,12 +75,12 @@ async fn rx_task(
                     //hal::println!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
                     if let Ok(received_comm_state) =
                         CommState::try_deserialize_packet(&mut rx_buffer[..=i]).map_err(|e| {
-                            hal::println!("RX err: {:?}", e);
+                            //hal::println!("RX err: {:?}", e);
                             e
                         })
                     {
                         let now = Instant::now();
-                        hal::println!("RX {}: packet {:?}", name, received_comm_state);
+                        //hal::println!("RX {}: packet {:?}", name, received_comm_state);
                         // We got a valid packet--update the state
 
                         let mut trickle_state = trickle_state
@@ -110,22 +113,47 @@ async fn rx_task(
                                     CommType::BlInit => {
                                         *bl_state = BlState::Init;
                                     }
-                                    CommType::BlBroadcastPing(bl_broadcast_ping) => match *bl_state
-                                    {
-                                        BlState::Ping(sn) if sn == *seq_num => {
-                                            // If we've already seen this ping, there is nothing to
-                                            // alter about it
+                                    CommType::BlBroadcastPing(bl_broadcast_ping) => {
+                                        match *bl_state {
+                                            BlState::Ping(sn) if sn == *seq_num => {
+                                                // If we've already seen this ping, there is nothing to
+                                                // alter about it
+                                            }
+                                            _ => {
+                                                // If this is the first time we've seen this ping,
+                                                // mark it with our observed latency.
+                                                bl_broadcast_ping.latency_micros =
+                                                    bl_broadcast_ping.age_micros.age_micros;
+                                                *bl_state = BlState::Ping(comm_state.seq_num)
+                                            }
                                         }
-                                        _ => {
-                                            // If this is the first time we've seen this ping,
-                                            // mark it with our observed latency.
-                                            bl_broadcast_ping.latency_micros =
-                                                bl_broadcast_ping.age_micros.age_micros;
-                                            *bl_state = BlState::Ping(comm_state.seq_num)
+                                    }
+                                    CommType::BlCodeWrite(bl_code_write) => {
+                                        let mut chunk_count = match *bl_state {
+                                            BlState::CodeWrite(chunk_count) => chunk_count,
+                                            _ => 0,
+                                        };
+                                        if chunk_count == bl_code_write.chunk_index {
+                                            let mut flash = flash.try_lock().expect(
+                                                "flash lock should not be held across .awaits",
+                                            );
+                                            let address =
+                                                0x08008000 + 256 * bl_code_write.chunk_index; // TODO use linker symbol
+                                            flash.write_page(address, &bl_code_write.chunk_data);
+                                            chunk_count += 1;
                                         }
-                                    },
-                                    CommType::BlCodeWrite(_bl_code_write) => {}
-                                    CommType::BlCodeProgress(_bl_code_progress) => {}
+                                        *bl_state = BlState::CodeWrite(chunk_count);
+                                    }
+                                    CommType::BlCodeProgress(bl_code_progress) => {
+                                        let chunk_count = match *bl_state {
+                                            BlState::CodeWrite(chunk_count) => chunk_count,
+                                            _ => {
+                                                *bl_state = BlState::CodeWrite(0);
+                                                0
+                                            }
+                                        };
+                                        bl_code_progress.chunk_count = chunk_count;
+                                    }
                                     CommType::BlUnknown => {}
                                 }
                                 {
@@ -212,7 +240,7 @@ async fn tx_task(
                         + 1;
                     len
                 });
-                hal::println!("TX west: {:?}", &tx_buffers[3][..lens[3]]);
+                //hal::println!("TX west: {:?}", &tx_buffers[3][..lens[3]]);
 
                 // Would be nice to find a cleaner way to do this...
                 let [u0, u1, u2, u3] = &mut usarts_tx;
@@ -240,6 +268,7 @@ fn main() -> ! {
         mut led_pwr,
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
+        flash,
     } = Hardware::init(true);
 
     led_pwr.set_pwr(true);
@@ -254,64 +283,39 @@ fn main() -> ! {
     let trickle_signal = Signal::new();
     let did_receive_packet = Mutex::new(false);
     let bl_state = Mutex::new(BlState::Init);
-    let (comm_state, trickle_state, trickle_signal, did_receive_packet, bl_state) = STATE.init((
-        comm_state,
-        trickle_state,
-        trickle_signal,
-        did_receive_packet,
-        bl_state,
-    ));
+    let flash = Mutex::new(flash);
+    let (comm_state, trickle_state, trickle_signal, did_receive_packet, bl_state, flash) = STATE
+        .init((
+            comm_state,
+            trickle_state,
+            trickle_signal,
+            did_receive_packet,
+            bl_state,
+            flash,
+        ));
 
     executor.run(|spawner| {
         spawner.spawn(main_task(did_receive_packet).unwrap());
-        spawner.spawn(
-            rx_task(
-                "North",
-                north_rx,
-                comm_state,
-                trickle_state,
-                trickle_signal,
-                did_receive_packet,
-                bl_state,
-            )
-            .unwrap(),
-        );
-        spawner.spawn(
-            rx_task(
-                "South",
-                south_rx,
-                comm_state,
-                trickle_state,
-                trickle_signal,
-                did_receive_packet,
-                bl_state,
-            )
-            .unwrap(),
-        );
-        spawner.spawn(
-            rx_task(
-                "East",
-                east_rx,
-                comm_state,
-                trickle_state,
-                trickle_signal,
-                did_receive_packet,
-                bl_state,
-            )
-            .unwrap(),
-        );
-        spawner.spawn(
-            rx_task(
-                "West",
-                west_rx,
-                comm_state,
-                trickle_state,
-                trickle_signal,
-                did_receive_packet,
-                bl_state,
-            )
-            .unwrap(),
-        );
+        for (name, rx) in [
+            ("North", north_rx),
+            ("South", south_rx),
+            ("East", east_rx),
+            ("West", west_rx),
+        ] {
+            spawner.spawn(
+                rx_task(
+                    name,
+                    rx,
+                    comm_state,
+                    trickle_state,
+                    trickle_signal,
+                    did_receive_packet,
+                    bl_state,
+                    flash,
+                )
+                .unwrap(),
+            );
+        }
         spawner.spawn(tx_task(usarts_tx, comm_state, trickle_state, trickle_signal).unwrap());
     });
 }

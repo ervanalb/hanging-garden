@@ -21,11 +21,12 @@ embassy-time-driver = "0.2.0"
 embassy-time-queue-utils = "0.3.0"
 
 [profile.release]
+debug = true
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
 lto = true
-opt-level = 3
+opt-level = "z"
 
 [profile.dev]
 strip = false
 lto = true
-opt-level = 2
+opt-level = 1

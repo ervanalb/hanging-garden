@@ -11,6 +11,7 @@ rustflags = [
 # runner = "wlink -v flash"
 
 # runner = "wlink -v flash --enable-sdi-print --watch-serial --erase"
-runner = "wlink flash --enable-sdi-print --watch-serial"
+# runner = "wlink flash --enable-sdi-print --watch-serial"
+runner = "./flash-gflash.sh"
 
 linker = "../../../ch32-rs/flip-link/target/debug/flip-link"

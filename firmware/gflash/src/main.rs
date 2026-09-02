@@ -129,7 +129,7 @@ async fn tx_task(
 
 const HIGH_PRIORITY_SEQ_INCREMENT: u64 = 8;
 const LONG_TIMEOUT: Duration = Duration::from_millis(1_000);
-const INITIAL_CODE_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
+const INITIAL_CODE_CHUNK_TIMEOUT: Duration = Duration::from_millis(100);
 const HARDWARE_ID: u32 = 1;
 const CHUNK_SIZE: usize = 256;
 
