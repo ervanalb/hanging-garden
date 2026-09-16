@@ -134,6 +134,8 @@ async fn rx_task(
                                             _ => 0,
                                         };
                                         if chunk_count == bl_code_write.chunk_index {
+                                            // TODO: Sleep for a short time before starting the flash write
+                                            // to allow the message to propagate to neighbors.
                                             let mut flash = flash.try_lock().expect(
                                                 "flash lock should not be held across .awaits",
                                             );

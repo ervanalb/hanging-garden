@@ -17,14 +17,65 @@ static STATE: StaticCell<(
     Signal<NoopRawMutex, ()>,
 )> = StaticCell::new();
 
+/// Convert HSV to RGB color space using integer math
+/// h: hue [0, 1535] representing 0-360 degrees scaled by 256/60
+/// s: saturation [0, 255]
+/// v: value [0, 255]
+/// Returns (r, g, b) in [0, 255]
+fn hsv2rgb(h: u16, s: u8, v: u8) -> (u8, u8, u8) {
+    // Wrap hue to [0, 1536)
+    let h = h % 1536;
+
+    let region = h / 256;
+    let remainder = (h % 256) as u8;
+
+    let p = (v as u16 * (255 - s) as u16 / 255) as u8;
+    let q = (v as u16 * (255 - (s as u16 * remainder as u16 / 255)) / 255) as u8;
+    let t = (v as u16 * (255 - (s as u16 * (255 - remainder) as u16 / 255)) / 255) as u8;
+
+    match region {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+fn gamma_correct(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    let (r, g, b) = rgb;
+    (r, g / 4, b / 4)
+}
+
 #[embassy_executor::task]
 async fn main_task(mut leds: Leds) {
+    const NUM_PIXELS: usize = 30;
+    const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
+
+    let mut buffer = [0u8; NUM_PIXELS * 3];
+    let mut time_offset: u16 = 0;
+
     loop {
-        //println!("Tick");
-        let _ = leds.write_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
-        Timer::after_millis(500).await;
-        let _ = leds.write_slice(&[0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
-        Timer::after_millis(500).await;
+        // Generate rainbow pattern
+        for pixel in 0..NUM_PIXELS {
+            // Hue varies with position: spread across full color wheel
+            let position_hue = (pixel as u16 * 1536 / NUM_PIXELS as u16) as u16;
+            let hue = (position_hue + time_offset) % 1536;
+
+            let (r, g, b) = gamma_correct(hsv2rgb(hue, 255, 25));
+
+            buffer[pixel * 3] = g;
+            buffer[pixel * 3 + 1] = r;
+            buffer[pixel * 3 + 2] = b;
+        }
+
+        let _ = leds.write_slice(&buffer);
+
+        // Update time offset for next frame
+        time_offset = (time_offset + 16) % 1536;
+
+        Timer::after_millis(FRAME_INTERVAL_MS).await;
     }
 }
 
