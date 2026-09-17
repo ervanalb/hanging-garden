@@ -1,6 +1,9 @@
 [build]
 target = "riscv32imc-unknown-none-elf"
 
+[env]
+DEFMT_LOG = { value = "off", force = false, relative = false }
+
 [target."riscv32imc-unknown-none-elf"]
 rustflags = [
   "-C", "link-arg=-Tdefmt.x",

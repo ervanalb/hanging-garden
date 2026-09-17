@@ -22,6 +22,7 @@ static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
 struct FlashWriteMsg {
     chunk_index: u32,
+    chunk_count: u32,
     chunk_data: heapless::Vec<u8, 256>,
 }
 
@@ -38,11 +39,15 @@ static STATE: StaticCell<(
 enum BlState {
     Init,
     Ping(u64),
-    CodeWrite(u32),
+    CodeWrite {
+        chunk_index: u32,
+        chunk_count: u32,
+        stalled: bool,
+    },
 }
 
 #[embassy_executor::task]
-async fn main_task(did_receive_packet: &'static Mutex<NoopRawMutex, bool>) {
+async fn branch_task(did_receive_packet: &'static Mutex<NoopRawMutex, bool>) {
     Timer::after_millis(500).await;
     // If no bootloader packets were received in the first 500ms,
     // branch to the app.
@@ -64,6 +69,77 @@ async fn main_task(did_receive_packet: &'static Mutex<NoopRawMutex, bool>) {
 }
 
 #[embassy_executor::task]
+async fn led_task(mut leds: hal::Leds, bl_state: &'static Mutex<NoopRawMutex, BlState>) {
+    loop {
+        // Read bl_state and generate LED pattern
+        let mut led_pattern = [0u8; 30]; // 10 LEDs * 3 bytes (GRB)
+
+        {
+            let bl_state = bl_state
+                .try_lock()
+                .expect("bl_state lock should not be held across .awaits");
+
+            match *bl_state {
+                BlState::CodeWrite {
+                    chunk_index,
+                    chunk_count,
+                    stalled,
+                } => {
+                    // Calculate progress percentage and number of LEDs to light up
+                    let progress_leds = if chunk_count > 0 {
+                        ((chunk_index as u64 * 10) / chunk_count as u64).min(10) as usize
+                    } else {
+                        0
+                    };
+
+                    // Colors in GRB format:
+                    // Bright blue (0x0000FF in RGB) = [G=0x00, R=0x00, B=0xFF]
+                    // Yellow (0xFFFF00 in RGB) = [G=0xFF, R=0xFF, B=0x00]
+                    // Dark blue (0x000001 in RGB) = [G=0x00, R=0x00, B=0x10]
+                    let progress_color;
+                    let bg_color;
+                    if stalled {
+                        progress_color = [0xFF, 0xFF, 0x00]; // Yellow (GRB)
+                        bg_color = [0x10, 0x10, 0x00]; // Dark Yellow (GRB)
+                    } else {
+                        progress_color = [0x00, 0x00, 0xFF]; // Blue (GRB)
+                        bg_color = [0x00, 0x00, 0x10]; // Dark blue (GRB)
+                    };
+
+                    // Fill progress LEDs
+                    for i in 0..progress_leds {
+                        led_pattern[i * 3] = progress_color[0];
+                        led_pattern[i * 3 + 1] = progress_color[1];
+                        led_pattern[i * 3 + 2] = progress_color[2];
+                    }
+
+                    // Fill remaining LEDs with dark blue
+                    for i in progress_leds..10 {
+                        led_pattern[i * 3] = bg_color[0];
+                        led_pattern[i * 3 + 1] = bg_color[1];
+                        led_pattern[i * 3 + 2] = bg_color[2];
+                    }
+                }
+                _ => {
+                    // Not in CodeWrite state, display all dark blue
+                    for i in 0..10 {
+                        led_pattern[i * 3] = 0x00; // G
+                        led_pattern[i * 3 + 1] = 0x00; // R
+                        led_pattern[i * 3 + 2] = 0x10; // B
+                    }
+                }
+            }
+        }
+
+        // Write LED pattern
+        let _ = leds.write_slice(&led_pattern);
+
+        // Wait until next frame time
+        Timer::after_millis(33).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn flash_writer_task(
     flash_channel: &'static Channel<NoopRawMutex, FlashWriteMsg, 1>,
     flash: &'static Mutex<NoopRawMutex, Flash>,
@@ -74,32 +150,42 @@ async fn flash_writer_task(
 
         defmt::debug!("Receive chunk");
 
-        let mut chunk_count = {
+        let mut chunk_index = {
             let bl_state = bl_state
                 .try_lock()
                 .expect("bl_state lock should not be held across .awaits");
             match *bl_state {
-                BlState::CodeWrite(chunk_count) => chunk_count,
+                BlState::CodeWrite { chunk_index, .. } => chunk_index,
                 _ => 0,
             }
         };
 
-        if chunk_count == msg.chunk_index {
+        let stalled;
+        if msg.chunk_index == chunk_index {
             let mut flash = flash
                 .try_lock()
                 .expect("flash lock should not be held across .awaits");
             let address = 0x08008000 + 256 * msg.chunk_index; // TODO use linker symbol
             flash.write_page(address, &msg.chunk_data).await;
-            chunk_count += 1;
-
-            let mut bl_state = bl_state
-                .try_lock()
-                .expect("bl_state lock should not be held across .awaits");
-            *bl_state = BlState::CodeWrite(chunk_count);
+            chunk_index = msg.chunk_index + 1;
+            stalled = false;
             defmt::info!("Write OK!");
+        } else if msg.chunk_index > chunk_index {
+            // We have fallen behind
+            stalled = true;
+            defmt::info!("Wrong chunk");
         } else {
-            defmt::warn!("Wrong chunk");
+            // We are ahead
+            stalled = false;
         }
+        let mut bl_state = bl_state
+            .try_lock()
+            .expect("bl_state lock should not be held across .awaits");
+        *bl_state = BlState::CodeWrite {
+            chunk_index,
+            chunk_count: msg.chunk_count,
+            stalled,
+        };
     }
 }
 
@@ -191,26 +277,20 @@ async fn rx_task(
                                         }
                                     }
                                     CommType::BlCodeWrite(bl_code_write) => {
-                                        defmt::info!(
-                                            "RX {}: BlCodeWrite(index={})",
-                                            name,
-                                            bl_code_write.chunk_index
-                                        );
                                         // Send the flash write message to the flash writer task
                                         let _ = flash_channel.try_send(FlashWriteMsg {
                                             chunk_index: bl_code_write.chunk_index,
+                                            chunk_count: bl_code_write.chunk_count,
                                             chunk_data: bl_code_write.chunk_data.clone(),
                                         });
                                     }
                                     CommType::BlCodeProgress(bl_code_progress) => {
-                                        let chunk_count = match *bl_state {
-                                            BlState::CodeWrite(chunk_count) => chunk_count,
-                                            _ => {
-                                                *bl_state = BlState::CodeWrite(0);
-                                                0
-                                            }
+                                        let chunk_index = match *bl_state {
+                                            BlState::CodeWrite { chunk_index, .. } => chunk_index,
+                                            _ => 0,
                                         };
-                                        bl_code_progress.chunk_count = chunk_count;
+                                        bl_code_progress.chunk_count =
+                                            bl_code_progress.chunk_count.min(chunk_index);
                                     }
                                     CommType::BlUnknown => {}
                                 }
@@ -323,7 +403,7 @@ async fn tx_task(
 #[qingke_rt::entry]
 fn main() -> ! {
     let Hardware {
-        leds: _,
+        leds,
         mut led_pwr,
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
@@ -363,7 +443,8 @@ fn main() -> ! {
     ));
 
     executor.run(|spawner| {
-        spawner.spawn(main_task(did_receive_packet).unwrap());
+        spawner.spawn(branch_task(did_receive_packet).unwrap());
+        spawner.spawn(led_task(leds, bl_state).unwrap());
         spawner.spawn(flash_writer_task(flash_channel, flash, bl_state).unwrap());
         for (name, rx) in [
             ("North", north_rx),
