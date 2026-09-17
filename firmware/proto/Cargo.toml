@@ -9,8 +9,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 postcard = { version = "1.0", features = ["use-crc"] }
 cobs = { version = "0.3", default-features = false }
 crc = "3.4"
-embassy-time = { version = "0.5", optional = true }
-heapless = { version = "0.9", features = ["serde"] }
+embassy-time = { version = "0.5", optional = true, features = ["defmt"] }
+heapless = { version = "0.9", features = ["serde", "defmt"] }
+defmt = "1.1"
 
 [features]
 default = ["app", "bl", "std"]

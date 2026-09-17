@@ -29,17 +29,10 @@ unsafe extern "C" {
     static _eusr: ();
 }
 
-pub static mut PRINTLN: bool = false;
-
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    if unsafe { PRINTLN } {
-        riscv::asm::delay(1_000_000);
-        use crate::println;
-        println!("*** PANIC ***");
-        println!("{}", info);
-    }
+    defmt::error!("PANIC: {}", defmt::Display2Format(info));
     loop {}
 }
 
@@ -73,16 +66,75 @@ impl core::fmt::Write for SDIPrint {
     }
 }
 
+// defmt global logger implementation using SDI
+#[defmt::global_logger]
+struct SdiLogger;
+
+// Static encoder for defmt frames
+static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
+
+unsafe impl defmt::Logger for SdiLogger {
+    fn acquire() {
+        // No locking needed for single-core embedded system
+        unsafe {
+            ENCODER.start_frame(do_write);
+        }
+    }
+
+    unsafe fn flush() {
+        // SDI is already synchronous, no flush needed
+    }
+
+    unsafe fn release() {
+        unsafe {
+            ENCODER.end_frame(do_write);
+        }
+    }
+
+    unsafe fn write(bytes: &[u8]) {
+        unsafe {
+            ENCODER.write(bytes, do_write);
+        }
+    }
+}
+
+// Internal function that actually writes encoded data to SDI
+fn do_write(bytes: &[u8]) {
+    let mut data = [0u8; 8];
+    for chunk in bytes.chunks(7) {
+        data[1..chunk.len() + 1].copy_from_slice(chunk);
+        data[0] = chunk.len() as u8;
+
+        // data1 is the last 4 bytes of data
+        let data1 = u32::from_le_bytes(data[4..].try_into().unwrap());
+        let data0 = u32::from_le_bytes(data[..4].try_into().unwrap());
+
+        // Wait for not busy
+        // SAFETY: Reading from DEBUG_DATA0_ADDRESS, a valid memory-mapped register
+        unsafe {
+            while core::ptr::read_volatile(DEBUG_DATA0_ADDRESS) != 0 {}
+        }
+
+        // SAFETY: Writing to valid memory-mapped registers
+        unsafe {
+            core::ptr::write_volatile(DEBUG_DATA1_ADDRESS, data1);
+            core::ptr::write_volatile(DEBUG_DATA0_ADDRESS, data0);
+        }
+    }
+}
+
+defmt::timestamp!("{=u64:us}", {
+    embassy_time::Instant::now().as_micros()
+});
+
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {
         {
-            if unsafe { $crate::PRINTLN } {
-                use core::fmt::Write;
-                use core::writeln;
+            use core::fmt::Write;
+            use core::writeln;
 
-                writeln!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
-            }
+            writeln!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
         }
     }
 }
@@ -91,12 +143,10 @@ macro_rules! println {
 macro_rules! print {
     ($($arg:tt)*) => {
         {
-            if unsafe { $crate::PRINTLN } {
-                use core::fmt::Write;
-                use core::write;
+            use core::fmt::Write;
+            use core::write;
 
-                write!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
-            }
+            write!(&mut $crate::SDIPrint {}, $($arg)*).unwrap();
         }
     }
 }
@@ -547,10 +597,7 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    pub fn init(println: bool) -> Self {
-        unsafe {
-            PRINTLN = println;
-        }
+    pub fn init() -> Self {
 
         // Configure system clock to 120 MHz from HSI
         // HSI = 8 MHz, PLL = HSI * 15 = 120 MHz
@@ -1244,7 +1291,7 @@ pub unsafe fn branch_to_bootloader() -> ! {
 pub struct Flash {}
 
 impl Flash {
-    /// Write a page of flash memory (up to 256 bytes) using fast erase and fast programming modes
+    /// Write a page of flash memory (up to 256 bytes) using fast erase and fast programming modes (async)
     ///
     /// This function uses:
     /// - Fast page erase (FTER) - 256 bytes
@@ -1259,8 +1306,7 @@ impl Flash {
     /// - The address is not 256-byte aligned
     /// - The data size exceeds 256 bytes
     /// - Flash is write protected
-    #[inline(never)] // XXX
-    pub fn write_page(&mut self, address: u32, data: &[u8]) {
+    pub async fn write_page(&mut self, address: u32, data: &[u8]) {
         // Validate inputs
         let susr = unsafe { (&_susr as *const ()) as u32 };
         let eusr = unsafe { (&_eusr as *const ()) as u32 };
@@ -1278,7 +1324,7 @@ impl Flash {
             return;
         }
 
-        critical_section::with(|_cs| unsafe {
+        critical_section::with(|_cs| {
             // Check LOCK bit and unlock if needed
             if pac::FLASH.ctlr().read().lock() {
                 pac::FLASH.keyr().write(|w| w.set_keyr(0x4567_0123));
@@ -1296,103 +1342,109 @@ impl Flash {
                 compiler_fence(Ordering::SeqCst);
             }
             assert!(!pac::FLASH.ctlr().read().flock(), "Fast unlock failed");
+        });
 
-            // Wait for BSY bit to confirm no operations in progress
-            while pac::FLASH.statr().read().bsy() {}
-            compiler_fence(Ordering::SeqCst);
-            assert!(
-                !pac::FLASH.statr().read().wrprterr(),
-                "Flash is write protected"
-            );
-            compiler_fence(Ordering::SeqCst);
+        // Wait for BSY bit to confirm no operations in progress (with yield)
+        while pac::FLASH.statr().read().bsy() {
+            embassy_futures::yield_now().await;
+        }
+        assert!(
+            !pac::FLASH.statr().read().wrprterr(),
+            "Flash is write protected"
+        );
+        compiler_fence(Ordering::SeqCst);
 
-            // ========== FAST PAGE ERASE (256 bytes) ==========
-            // Set FTER bit to enable fast page erase mode
-            pac::FLASH.ctlr().modify(|w| w.set_page_er(true));
+        // ========== FAST PAGE ERASE (256 bytes) ==========
+        // Set FTER bit to enable fast page erase mode
+        pac::FLASH.ctlr().modify(|w| w.set_page_er(true));
 
-            // Write the first address of the page to FLASH_ADDR
-            pac::FLASH.addr().write(|w| w.set_far(address));
-            compiler_fence(Ordering::SeqCst);
+        // Write the first address of the page to FLASH_ADDR
+        pac::FLASH.addr().write(|w| w.set_far(address));
+        compiler_fence(Ordering::SeqCst);
 
-            // Set STRT bit to start fast page erase
-            pac::FLASH.ctlr().modify(|w| w.set_strt(true));
-            compiler_fence(Ordering::SeqCst);
+        // Set STRT bit to start fast page erase
+        pac::FLASH.ctlr().modify(|w| w.set_strt(true));
+        compiler_fence(Ordering::SeqCst);
 
-            // Wait for BSY bit to become 0
-            while pac::FLASH.statr().read().bsy() {}
-            compiler_fence(Ordering::SeqCst);
-            assert!(
-                !pac::FLASH.statr().read().wrprterr(),
-                "Flash is write protected"
-            );
-            compiler_fence(Ordering::SeqCst);
+        // Wait for BSY bit to become 0 (with yield)
+        while pac::FLASH.statr().read().bsy() {
+            embassy_futures::yield_now().await;
+        }
+        assert!(
+            !pac::FLASH.statr().read().wrprterr(),
+            "Flash is write protected"
+        );
+        compiler_fence(Ordering::SeqCst);
 
-            // Check EOP and clear it
-            assert!(
-                pac::FLASH.statr().read().eop(),
-                "Flash erase did not complete. statr={:#010x}",
-                pac::FLASH.statr().read().0
-            );
-            compiler_fence(Ordering::SeqCst);
-            pac::FLASH.statr().modify(|w| w.set_eop(true));
+        // Check EOP and clear it
+        assert!(
+            pac::FLASH.statr().read().eop(),
+            "Flash erase did not complete. statr={:#010x}",
+            pac::FLASH.statr().read().0
+        );
+        compiler_fence(Ordering::SeqCst);
+        pac::FLASH.statr().modify(|w| w.set_eop(true));
 
-            // Clear FTER bit when erasing ends
-            pac::FLASH.ctlr().modify(|w| w.set_page_er(false));
+        // Clear FTER bit when erasing ends
+        pac::FLASH.ctlr().modify(|w| w.set_page_er(false));
 
-            // ========== FAST PAGE PROGRAMMING (256 bytes) ==========
-            // Set FTPG bit to enable fast page programming mode
-            pac::FLASH.ctlr().modify(|w| w.set_page_pg(true));
-            compiler_fence(Ordering::SeqCst);
+        // ========== FAST PAGE PROGRAMMING (256 bytes) ==========
+        // Set FTPG bit to enable fast page programming mode
+        pac::FLASH.ctlr().modify(|w| w.set_page_pg(true));
+        compiler_fence(Ordering::SeqCst);
 
-            // Write data in 4-byte chunks (up to 64 times for 256 bytes)
-            let mut addr = address;
+        // Write data in 4-byte chunks (up to 64 times for 256 bytes)
+        let mut addr = address;
 
-            for word_chunk in data.chunks(4) {
-                // Pad the last chunk with 0xFF if needed
-                let mut word_bytes = [0xFF_u8; 4];
-                word_bytes[..word_chunk.len()].copy_from_slice(word_chunk);
-                let word = u32::from_le_bytes(word_bytes);
+        for word_chunk in data.chunks(4) {
+            // Pad the last chunk with 0xFF if needed
+            let mut word_bytes = [0xFF_u8; 4];
+            word_bytes[..word_chunk.len()].copy_from_slice(word_chunk);
+            let word = u32::from_le_bytes(word_bytes);
 
+            unsafe {
                 // Write 32-bit data to flash address
                 core::ptr::write_volatile(addr as *mut u32, word);
-                addr += 4;
-                compiler_fence(Ordering::SeqCst);
-
-                // Wait for WR_BSY to become 0
-                while pac::FLASH.statr().read().wr_bsy() {}
-                compiler_fence(Ordering::SeqCst);
             }
-
-            // Set PG_START bit to start fast page programming
-            pac::FLASH.ctlr().modify(|w| w.set_pgstart(true));
+            addr += 4;
             compiler_fence(Ordering::SeqCst);
 
-            // Wait for BSY bit to become 0
-            while pac::FLASH.statr().read().bsy() {}
-            compiler_fence(Ordering::SeqCst);
-            assert!(
-                !pac::FLASH.statr().read().wrprterr(),
-                "Flash is write protected"
-            );
-            compiler_fence(Ordering::SeqCst);
+            // Wait for WR_BSY to become 0 (with yield)
+            while pac::FLASH.statr().read().wr_bsy() {
+                embassy_futures::yield_now().await;
+            }
+        }
 
-            // Check EOP and clear it
-            assert!(
-                pac::FLASH.statr().read().eop(),
-                "Flash programming did not complete"
-            );
-            compiler_fence(Ordering::SeqCst);
-            pac::FLASH.statr().modify(|w| w.set_eop(true));
+        // Set PG_START bit to start fast page programming
+        pac::FLASH.ctlr().modify(|w| w.set_pgstart(true));
+        compiler_fence(Ordering::SeqCst);
 
-            // Unclear if FTPG/BTPG bit is cleared automatically.
-            pac::FLASH.ctlr().modify(|w| w.set_page_pg(false));
-            compiler_fence(Ordering::SeqCst);
+        // Wait for BSY bit to become 0 (with yield)
+        while pac::FLASH.statr().read().bsy() {
+            embassy_futures::yield_now().await;
+        }
+        assert!(
+            !pac::FLASH.statr().read().wrprterr(),
+            "Flash is write protected"
+        );
+        compiler_fence(Ordering::SeqCst);
 
-            // Lock the flash
-            pac::FLASH.ctlr().modify(|w| {
-                w.set_lock(true);
-                w.set_flock(true);
-            });
-        })
+        // Check EOP and clear it
+        assert!(
+            pac::FLASH.statr().read().eop(),
+            "Flash programming did not complete"
+        );
+        compiler_fence(Ordering::SeqCst);
+        pac::FLASH.statr().modify(|w| w.set_eop(true));
+
+        // Unclear if FTPG/BTPG bit is cleared automatically.
+        pac::FLASH.ctlr().modify(|w| w.set_page_pg(false));
+        compiler_fence(Ordering::SeqCst);
+
+        // Lock the flash
+        pac::FLASH.ctlr().modify(|w| {
+            w.set_lock(true);
+            w.set_flock(true);
+        });
     }
 }

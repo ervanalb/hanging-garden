@@ -1,8 +1,17 @@
 #![no_std]
 #![no_main]
 
+// Compile-time flag to control branching to app
+macro_rules! bl_branch_enabled {
+    () => {
+        !matches!(option_env!("BL_BRANCH"), Some("NO") | Some("no"))
+    };
+}
+
 use embassy_futures::join::join_array;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
+use embassy_sync::{
+    blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
+};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
 use hal::{Flash, Hardware, UsartRx, UsartTx};
 use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
@@ -11,6 +20,11 @@ use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
 
 static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
+struct FlashWriteMsg {
+    chunk_index: u32,
+    chunk_data: heapless::Vec<u8, 256>,
+}
+
 static STATE: StaticCell<(
     Mutex<NoopRawMutex, CommState>,
     Mutex<NoopRawMutex, TrickleState>,
@@ -18,6 +32,7 @@ static STATE: StaticCell<(
     Mutex<NoopRawMutex, bool>,
     Mutex<NoopRawMutex, BlState>,
     Mutex<NoopRawMutex, Flash>,
+    Channel<NoopRawMutex, FlashWriteMsg, 1>,
 )> = StaticCell::new();
 
 enum BlState {
@@ -36,14 +51,56 @@ async fn main_task(did_receive_packet: &'static Mutex<NoopRawMutex, bool>) {
             .try_lock()
             .expect("did_receive_packet should not be held across .awaits");
         if !*did_receive_packet {
-            // Safety: we are not in an interrupt
-            unsafe {
-                hal::branch_to_app();
+            if bl_branch_enabled!() {
+                // Safety: we are not in an interrupt
+                unsafe {
+                    hal::branch_to_app();
+                }
             }
         }
     }
     // Wait forever
     core::future::pending::<()>().await;
+}
+
+#[embassy_executor::task]
+async fn flash_writer_task(
+    flash_channel: &'static Channel<NoopRawMutex, FlashWriteMsg, 1>,
+    flash: &'static Mutex<NoopRawMutex, Flash>,
+    bl_state: &'static Mutex<NoopRawMutex, BlState>,
+) {
+    loop {
+        let msg = flash_channel.receive().await;
+
+        defmt::debug!("Receive chunk");
+
+        let mut chunk_count = {
+            let bl_state = bl_state
+                .try_lock()
+                .expect("bl_state lock should not be held across .awaits");
+            match *bl_state {
+                BlState::CodeWrite(chunk_count) => chunk_count,
+                _ => 0,
+            }
+        };
+
+        if chunk_count == msg.chunk_index {
+            let mut flash = flash
+                .try_lock()
+                .expect("flash lock should not be held across .awaits");
+            let address = 0x08008000 + 256 * msg.chunk_index; // TODO use linker symbol
+            flash.write_page(address, &msg.chunk_data).await;
+            chunk_count += 1;
+
+            let mut bl_state = bl_state
+                .try_lock()
+                .expect("bl_state lock should not be held across .awaits");
+            *bl_state = BlState::CodeWrite(chunk_count);
+            defmt::info!("Write OK!");
+        } else {
+            defmt::warn!("Wrong chunk");
+        }
+    }
 }
 
 #[embassy_executor::task(pool_size = 4)]
@@ -55,7 +112,7 @@ async fn rx_task(
     trickle_signal: &'static Signal<NoopRawMutex, ()>,
     did_receive_packet: &'static Mutex<NoopRawMutex, bool>,
     bl_state: &'static Mutex<NoopRawMutex, BlState>,
-    flash: &'static Mutex<NoopRawMutex, Flash>,
+    flash_channel: &'static Channel<NoopRawMutex, FlashWriteMsg, 1>,
 ) {
     let mut rx_buffer = heapless::Vec::<_, MAX_PACKET_LEN>::new();
     let mut overrun = false;
@@ -72,15 +129,15 @@ async fn rx_task(
                 // Decode slice if it is non-zero length and not overrun
                 if i > 0 && !overrun {
                     // Deserialize rx_buffer[..i]
-                    //hal::println!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
+                    defmt::trace!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
                     if let Ok(received_comm_state) =
                         CommState::try_deserialize_packet(&mut rx_buffer[..=i]).map_err(|e| {
-                            //hal::println!("RX err: {:?}", e);
+                            defmt::debug!("RX err: {:?}", defmt::Debug2Format(&e));
                             e
                         })
                     {
                         let now = Instant::now();
-                        //hal::println!("RX {}: packet {:?}", name, received_comm_state);
+                        defmt::debug!("RX {}: packet {:?}", name, received_comm_state);
                         // We got a valid packet--update the state
 
                         let mut trickle_state = trickle_state
@@ -105,9 +162,14 @@ async fn rx_task(
                                 match type_ {
                                     CommType::Unknown => {
                                         // Reboot into app
-                                        // Safety: we are not in an interrupt
-                                        unsafe {
-                                            hal::branch_to_app();
+                                        if bl_branch_enabled!() {
+                                            defmt::info!("Branching to app...");
+                                            // Safety: we are not in an interrupt
+                                            unsafe {
+                                                hal::branch_to_app();
+                                            }
+                                        } else {
+                                            defmt::info!("Branch to app disabled");
                                         }
                                     }
                                     CommType::BlInit => {
@@ -129,22 +191,16 @@ async fn rx_task(
                                         }
                                     }
                                     CommType::BlCodeWrite(bl_code_write) => {
-                                        let mut chunk_count = match *bl_state {
-                                            BlState::CodeWrite(chunk_count) => chunk_count,
-                                            _ => 0,
-                                        };
-                                        if chunk_count == bl_code_write.chunk_index {
-                                            // TODO: Sleep for a short time before starting the flash write
-                                            // to allow the message to propagate to neighbors.
-                                            let mut flash = flash.try_lock().expect(
-                                                "flash lock should not be held across .awaits",
-                                            );
-                                            let address =
-                                                0x08008000 + 256 * bl_code_write.chunk_index; // TODO use linker symbol
-                                            flash.write_page(address, &bl_code_write.chunk_data);
-                                            chunk_count += 1;
-                                        }
-                                        *bl_state = BlState::CodeWrite(chunk_count);
+                                        defmt::info!(
+                                            "RX {}: BlCodeWrite(index={})",
+                                            name,
+                                            bl_code_write.chunk_index
+                                        );
+                                        // Send the flash write message to the flash writer task
+                                        let _ = flash_channel.try_send(FlashWriteMsg {
+                                            chunk_index: bl_code_write.chunk_index,
+                                            chunk_data: bl_code_write.chunk_data.clone(),
+                                        });
                                     }
                                     CommType::BlCodeProgress(bl_code_progress) => {
                                         let chunk_count = match *bl_state {
@@ -169,7 +225,7 @@ async fn rx_task(
                                 trickle_state.got_new_state(now);
                             }
                             TrickleOrdering::Consistent => {
-                                trickle_state.got_outdated_state(now);
+                                trickle_state.got_consistent_state();
                             }
                             TrickleOrdering::Less => {
                                 trickle_state.got_outdated_state(now);
@@ -190,6 +246,8 @@ async fn rx_task(
         }
         if rx_buffer.is_full() {
             overrun = true;
+            rx_buffer.clear();
+            defmt::info!("{} Overrun", name);
         }
     }
 }
@@ -229,11 +287,11 @@ async fn tx_task(
 
                 let lens: [_; 4] = core::array::from_fn(|i| {
                     let transmit_comm_state = &propagated[i];
-                    //hal::println!(
-                    //    "TX {}: {:?}",
-                    //    ["North", "South", "East", "West"][i],
-                    //    &transmit_comm_state
-                    //);
+                    defmt::debug!(
+                        "TX {}: {:?}",
+                        ["North", "South", "East", "West"][i],
+                        &transmit_comm_state
+                    );
                     let tx_buffer = &mut tx_buffers[i];
                     // We retain an initial '\0' to improve packet start detection
                     let len = transmit_comm_state
@@ -242,7 +300,6 @@ async fn tx_task(
                         + 1;
                     len
                 });
-                //hal::println!("TX west: {:?}", &tx_buffers[3][..lens[3]]);
 
                 // Would be nice to find a cleaner way to do this...
                 let [u0, u1, u2, u3] = &mut usarts_tx;
@@ -271,7 +328,7 @@ fn main() -> ! {
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash,
-    } = Hardware::init(true);
+    } = Hardware::init();
 
     led_pwr.set_pwr(true);
 
@@ -286,18 +343,28 @@ fn main() -> ! {
     let did_receive_packet = Mutex::new(false);
     let bl_state = Mutex::new(BlState::Init);
     let flash = Mutex::new(flash);
-    let (comm_state, trickle_state, trickle_signal, did_receive_packet, bl_state, flash) = STATE
-        .init((
-            comm_state,
-            trickle_state,
-            trickle_signal,
-            did_receive_packet,
-            bl_state,
-            flash,
-        ));
+    let flash_channel = Channel::new();
+    let (
+        comm_state,
+        trickle_state,
+        trickle_signal,
+        did_receive_packet,
+        bl_state,
+        flash,
+        flash_channel,
+    ) = STATE.init((
+        comm_state,
+        trickle_state,
+        trickle_signal,
+        did_receive_packet,
+        bl_state,
+        flash,
+        flash_channel,
+    ));
 
     executor.run(|spawner| {
         spawner.spawn(main_task(did_receive_packet).unwrap());
+        spawner.spawn(flash_writer_task(flash_channel, flash, bl_state).unwrap());
         for (name, rx) in [
             ("North", north_rx),
             ("South", south_rx),
@@ -313,7 +380,7 @@ fn main() -> ! {
                     trickle_signal,
                     did_receive_packet,
                     bl_state,
-                    flash,
+                    flash_channel,
                 )
                 .unwrap(),
             );

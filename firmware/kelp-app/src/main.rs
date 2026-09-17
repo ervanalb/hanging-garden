@@ -50,7 +50,7 @@ fn gamma_correct(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
 
 #[embassy_executor::task]
 async fn main_task(mut leds: Leds) {
-    const NUM_PIXELS: usize = 30;
+    const NUM_PIXELS: usize = 3;
     const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
 
     let mut buffer = [0u8; NUM_PIXELS * 3];
@@ -102,15 +102,15 @@ async fn rx_task(
                 // Decode slice if it is non-zero length and not overrun
                 if i > 0 && !overrun {
                     // Deserialize rx_buffer[..i]
-                    //hal::println!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
+                    defmt::trace!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
                     if let Ok(received_comm_state) =
                         CommState::try_deserialize_packet(&mut rx_buffer[..=i]).map_err(|e| {
-                            hal::println!("RX err: {:?}", e);
+                            defmt::debug!("RX err: {:?}", defmt::Debug2Format(&e));
                             e
                         })
                     {
                         let now = Instant::now();
-                        hal::println!("RX {}: {:?}", name, received_comm_state);
+                        defmt::info!("RX {}: {:?}", name, received_comm_state);
                         // We got a valid packet--update the state
 
                         let mut trickle_state = trickle_state
@@ -138,7 +138,7 @@ async fn rx_task(
                                 trickle_state.got_new_state(now);
                             }
                             TrickleOrdering::Consistent => {
-                                trickle_state.got_outdated_state(now);
+                                trickle_state.got_consistent_state();
                             }
                             TrickleOrdering::Less => {
                                 trickle_state.got_outdated_state(now);
@@ -158,6 +158,7 @@ async fn rx_task(
             }
         }
         if rx_buffer.is_full() {
+            rx_buffer.clear();
             overrun = true;
         }
     }
@@ -198,7 +199,7 @@ async fn tx_task(
 
                 let lens: [_; 4] = core::array::from_fn(|i| {
                     let transmit_comm_state = &propagated[i];
-                    hal::println!(
+                    defmt::debug!(
                         "TX {}: {:?}",
                         ["North", "South", "East", "West"][i],
                         &transmit_comm_state
@@ -239,7 +240,7 @@ fn main() -> ! {
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash: _,
-    } = Hardware::init(false);
+    } = Hardware::init();
 
     led_pwr.set_pwr(true);
 

@@ -25,7 +25,7 @@ pub const TRICKLE_PARAMS: TrickleParams = TrickleParams {
 
 pub const MAX_PACKET_LEN: usize = 300;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, defmt::Format)]
 pub struct CommState {
     pub seq_num: u64,
     pub type_: CommType,
@@ -109,7 +109,7 @@ pub const COMM_TYPE_TEST_BL_UNKNOWN: u8 = 0xFE;
 
 pub const COMM_TYPE_BL_BITMASK: u8 = COMM_TYPE_BL_INIT;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, defmt::Format)]
 #[repr(u8)]
 pub enum CommType {
     #[cfg(feature = "app")]
@@ -437,10 +437,18 @@ impl CommType {
             }
             #[cfg(test)]
             (CommType::TestBlUnknown(_), CommType::TestBlUnknown(_)) => TrickleOrdering::Consistent,
-            #[cfg(feature = "app")]
             (s, CommType::Unknown) if !s.is_bl() => TrickleOrdering::Consistent,
+            (CommType::Unknown, o) if !o.is_bl() => TrickleOrdering::Greater,
             (s, CommType::BlUnknown) if s.is_bl() => TrickleOrdering::Consistent,
-            (s, o) => o.discriminant().cmp(&s.discriminant()).into(),
+            (CommType::BlUnknown, o) if o.is_bl() => TrickleOrdering::Greater,
+            (s, o) => {
+                // First compare by domain: app types (false) are Greater than BL types (true)
+                s.is_bl()
+                    .cmp(&o.is_bl())
+                    // Then within same domain: higher discriminant is Greater
+                    .then(o.discriminant().cmp(&s.discriminant()))
+                    .into()
+            }
         }
     }
 }
@@ -579,6 +587,12 @@ pub struct AgeMicros {
     pub last_update: Option<Instant>,
 }
 
+impl defmt::Format for AgeMicros {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "AgeMicros {{ age_micros: {} }}", self.age_micros)
+    }
+}
+
 #[cfg(feature = "bl")]
 impl AgeMicros {
     /// Update the age_micros field so it is accurate for the given current time
@@ -597,7 +611,7 @@ impl AgeMicros {
 }
 
 #[cfg(feature = "bl")]
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, defmt::Format)]
 pub struct BlBroadcastPing {
     pub latency_micros: u64,
     pub age_micros: AgeMicros,
@@ -617,7 +631,7 @@ impl BlBroadcastPing {
 }
 
 #[cfg(feature = "bl")]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, defmt::Format)]
 pub struct BlCodeWrite {
     pub hardware_id: u32,
     pub chunk_count: u32,
@@ -633,7 +647,7 @@ impl BlCodeWrite {
 }
 
 #[cfg(feature = "bl")]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, defmt::Format)]
 pub struct BlCodeProgress {
     pub hardware_id: u32,
     pub chunk_count: u32,
@@ -879,6 +893,174 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             postcard::Error::DeserializeBadCrc
+        ));
+    }
+
+    #[test]
+    fn test_consider_unknown_states() {
+        // Test app-side states with Unknown
+        #[cfg(feature = "app")]
+        {
+            let init_state = CommState {
+                seq_num: 100,
+                type_: CommType::Init,
+            };
+            let unknown_state = CommState {
+                seq_num: 100,
+                type_: CommType::Unknown,
+            };
+
+            // Init.consider(Unknown) should produce Consistent
+            assert!(matches!(
+                init_state.consider(&unknown_state),
+                TrickleOrdering::Consistent
+            ));
+
+            // Unknown.consider(Init) should produce Greater
+            assert!(matches!(
+                unknown_state.consider(&init_state),
+                TrickleOrdering::Greater
+            ));
+        }
+
+        // Test bootloader-side states with BlUnknown
+        #[cfg(feature = "bl")]
+        {
+            let bl_init_state = CommState {
+                seq_num: 200,
+                type_: CommType::BlInit,
+            };
+            let bl_unknown_state = CommState {
+                seq_num: 200,
+                type_: CommType::BlUnknown,
+            };
+
+            // BlInit.consider(BlUnknown) should produce Consistent
+            assert!(matches!(
+                bl_init_state.consider(&bl_unknown_state),
+                TrickleOrdering::Consistent
+            ));
+
+            // BlUnknown.consider(BlInit) should produce Greater
+            assert!(matches!(
+                bl_unknown_state.consider(&bl_init_state),
+                TrickleOrdering::Greater
+            ));
+
+            let bl_ping_state = CommState {
+                seq_num: 200,
+                type_: CommType::BlBroadcastPing(BlBroadcastPing {
+                    latency_micros: 1000,
+                    age_micros: AgeMicros {
+                        age_micros: 2000,
+                        last_update: None,
+                    },
+                    data: heapless::Vec::new(),
+                }),
+            };
+
+            // BlBroadcastPing.consider(BlUnknown) should produce Consistent
+            assert!(matches!(
+                bl_ping_state.consider(&bl_unknown_state),
+                TrickleOrdering::Consistent
+            ));
+
+            // BlUnknown.consider(BlBroadcastPing) should produce Greater
+            assert!(matches!(
+                bl_unknown_state.consider(&bl_ping_state),
+                TrickleOrdering::Greater
+            ));
+        }
+
+        // Test that Unknown and BlUnknown don't cross domains
+        let unknown_state = CommState {
+            seq_num: 400,
+            type_: CommType::Unknown,
+        };
+        let bl_unknown_state = CommState {
+            seq_num: 400,
+            type_: CommType::BlUnknown,
+        };
+
+        // Unknown.consider(BlUnknown) should NOT produce Consistent (different domains)
+        assert!(!matches!(
+            unknown_state.consider(&bl_unknown_state),
+            TrickleOrdering::Consistent
+        ));
+
+        // BlUnknown.consider(Unknown) should NOT produce Consistent (different domains)
+        assert!(!matches!(
+            bl_unknown_state.consider(&unknown_state),
+            TrickleOrdering::Consistent
+        ));
+    }
+
+    #[test]
+    fn test_unknown_consistent_with_unknown() {
+        // Test that Unknown is consistent with itself
+        let unknown_state1 = CommState {
+            seq_num: 500,
+            type_: CommType::Unknown,
+        };
+        let unknown_state2 = CommState {
+            seq_num: 500,
+            type_: CommType::Unknown,
+        };
+
+        assert!(matches!(
+            unknown_state1.consider(&unknown_state2),
+            TrickleOrdering::Consistent
+        ));
+        assert!(matches!(
+            unknown_state2.consider(&unknown_state1),
+            TrickleOrdering::Consistent
+        ));
+
+        // Test that BlUnknown is consistent with itself
+        let bl_unknown_state1 = CommState {
+            seq_num: 600,
+            type_: CommType::BlUnknown,
+        };
+        let bl_unknown_state2 = CommState {
+            seq_num: 600,
+            type_: CommType::BlUnknown,
+        };
+
+        assert!(matches!(
+            bl_unknown_state1.consider(&bl_unknown_state2),
+            TrickleOrdering::Consistent
+        ));
+        assert!(matches!(
+            bl_unknown_state2.consider(&bl_unknown_state1),
+            TrickleOrdering::Consistent
+        ));
+    }
+
+    #[test]
+    #[cfg(all(feature = "app", feature = "bl"))]
+    fn test_app_types_greater_than_bl_types() {
+        // Test that app types are considered Greater than BL types
+        let app_state = CommState {
+            seq_num: 0,
+            type_: CommType::Init,
+        };
+        let bl_state = CommState {
+            seq_num: 0,
+            type_: CommType::BlInit,
+        };
+
+        // App.consider(BL) should produce Less
+        assert!(matches!(
+            app_state.consider(&bl_state),
+            TrickleOrdering::Less
+        ));
+
+        // BL.consider(App) should produce Greater
+        // (since App runs after the bootloader
+        // and both may have a seq_num of 0)
+        assert!(matches!(
+            bl_state.consider(&app_state),
+            TrickleOrdering::Greater
         ));
     }
 }

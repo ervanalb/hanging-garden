@@ -19,6 +19,7 @@ embassy-sync = { version = "0.8" }
 embassy-futures = "0.1"
 static_cell = "2.1"
 heapless = "0.9"
+defmt = "1.1"
 
 [profile.release]
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
