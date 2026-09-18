@@ -32,7 +32,8 @@ unsafe extern "C" {
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    defmt::error!("PANIC: {}", defmt::Display2Format(info));
+    defmt::error!("*** PANIC ***");
+    defmt::debug!("{}", defmt::Display2Format(info));
     loop {}
 }
 
@@ -111,9 +112,7 @@ fn do_write(bytes: &[u8]) {
 
         // Wait for not busy
         // SAFETY: Reading from DEBUG_DATA0_ADDRESS, a valid memory-mapped register
-        unsafe {
-            while core::ptr::read_volatile(DEBUG_DATA0_ADDRESS) != 0 {}
-        }
+        unsafe { while core::ptr::read_volatile(DEBUG_DATA0_ADDRESS) != 0 {} }
 
         // SAFETY: Writing to valid memory-mapped registers
         unsafe {
@@ -123,9 +122,7 @@ fn do_write(bytes: &[u8]) {
     }
 }
 
-defmt::timestamp!("{=u64:us}", {
-    embassy_time::Instant::now().as_micros()
-});
+defmt::timestamp!("{=u64:us}", { embassy_time::Instant::now().as_micros() });
 
 #[macro_export]
 macro_rules! println {
@@ -598,7 +595,6 @@ pub struct Hardware {
 
 impl Hardware {
     pub fn init() -> Self {
-
         // Configure system clock to 120 MHz from HSI
         // HSI = 8 MHz, PLL = HSI * 15 = 120 MHz
         // Enable HSI

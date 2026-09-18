@@ -8,6 +8,29 @@ macro_rules! bl_branch_enabled {
     };
 }
 
+/// Bootloader configuration structure placed in BOOTLOADER_CONFIG_USR section
+#[repr(C)]
+struct BootloaderConfig {
+    magic: u32,
+    firmware_size_bytes: u32,
+    firmware_crc32: u32,
+}
+
+/// Static bootloader configuration placed in the BOOTLOADER_CONFIG_USR linker section
+#[unsafe(link_section = ".bootloader_config_usr")]
+#[used]
+static BOOTLOADER_CONFIG: BootloaderConfig = BootloaderConfig {
+    magic: 0,
+    firmware_size_bytes: 0,
+    firmware_crc32: 0,
+};
+
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    static _sapp_usr: ();
+    static _eapp_usr: ();
+}
+
 use embassy_futures::join::join_array;
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
@@ -18,7 +41,85 @@ use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
 
+static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
+
 static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
+
+const BOOTLOADER_CONFIG_MAGIC: u32 = 0x7ac37303;
+
+/// Validates the application firmware using the CRC32 from BOOTLOADER_CONFIG and branches to app if valid.
+///
+/// # Safety
+/// This function may branch to application code.
+/// It should only be called when not in an interrupt.
+unsafe fn validate_and_branch_to_app(bl_state: &mut BlState) {
+    // Read the config from flash
+    // Safety: BOOTLOADER_CONFIG is at a fixed, valid memory location
+    let config_ptr = &BOOTLOADER_CONFIG as *const BootloaderConfig;
+    let config = unsafe { core::ptr::read_volatile(config_ptr) };
+
+    // Check magic number
+    if config.magic != BOOTLOADER_CONFIG_MAGIC {
+        defmt::warn!("Invalid magic number in config: 0x{:08X}", config.magic);
+        *bl_state = BlState::InvalidApp;
+        return;
+    }
+
+    // Check firmware size is reasonable (not zero, not larger than APP flash)
+    let app_flash_size =
+        unsafe { (&_eapp_usr as *const ()) as u32 - (&_sapp_usr as *const ()) as u32 };
+    if config.firmware_size_bytes == 0 || config.firmware_size_bytes > app_flash_size {
+        defmt::warn!(
+            "Invalid firmware size: {} bytes",
+            config.firmware_size_bytes
+        );
+        *bl_state = BlState::InvalidApp;
+        return;
+    }
+
+    defmt::info!(
+        "Validating app: size={} bytes, expected CRC32=0x{:08X}",
+        config.firmware_size_bytes,
+        config.firmware_crc32
+    );
+
+    // Read application flash and compute CRC32
+    let app_flash_start = unsafe { (&_sapp_usr as *const ()) as u32 };
+    let mut digest = CRC.digest();
+
+    // Process in chunks to avoid long operations
+    let mut offset = 0;
+    while offset < config.firmware_size_bytes {
+        let chunk_size = (config.firmware_size_bytes - offset).min(256);
+        // Safety: Reading from flash memory within the application region
+        let chunk_ptr = unsafe { (app_flash_start as *const u8).add(offset as usize) };
+        let chunk_slice = unsafe { core::slice::from_raw_parts(chunk_ptr, chunk_size as usize) };
+        digest.update(chunk_slice);
+        offset += chunk_size;
+    }
+
+    let calculated_crc = digest.finalize();
+
+    if calculated_crc == config.firmware_crc32 {
+        defmt::info!("App validation successful!");
+        // Safety: Caller ensures we're not in an interrupt
+        if bl_branch_enabled!() {
+            defmt::info!("Branching to app...");
+            unsafe {
+                hal::branch_to_app();
+            }
+        } else {
+            defmt::info!("Not branching to app (disabled by compile-time flag)");
+        }
+    } else {
+        defmt::warn!(
+            "App validation FAILED! Calculated CRC32=0x{:08X}, expected 0x{:08X}",
+            calculated_crc,
+            config.firmware_crc32
+        );
+        *bl_state = BlState::InvalidApp;
+    }
+}
 
 struct FlashWriteMsg {
     chunk_index: u32,
@@ -43,24 +144,30 @@ enum BlState {
         chunk_index: u32,
         chunk_count: u32,
         stalled: bool,
+        crc32_digest: crc::Digest<'static, u32>,
     },
+    InvalidApp,
 }
 
 #[embassy_executor::task]
-async fn branch_task(did_receive_packet: &'static Mutex<NoopRawMutex, bool>) {
+async fn branch_task(
+    did_receive_packet: &'static Mutex<NoopRawMutex, bool>,
+    bl_state: &'static Mutex<NoopRawMutex, BlState>,
+) {
     Timer::after_millis(500).await;
     // If no bootloader packets were received in the first 500ms,
-    // branch to the app.
+    // validate and branch to the app.
     {
         let did_receive_packet = did_receive_packet
             .try_lock()
             .expect("did_receive_packet should not be held across .awaits");
         if !*did_receive_packet {
-            if bl_branch_enabled!() {
-                // Safety: we are not in an interrupt
-                unsafe {
-                    hal::branch_to_app();
-                }
+            // Safety: we are not in an interrupt
+            let mut bl_state_guard = bl_state
+                .try_lock()
+                .expect("bl_state lock should not be held across .awaits");
+            unsafe {
+                validate_and_branch_to_app(&mut *bl_state_guard);
             }
         }
     }
@@ -84,6 +191,7 @@ async fn led_task(mut leds: hal::Leds, bl_state: &'static Mutex<NoopRawMutex, Bl
                     chunk_index,
                     chunk_count,
                     stalled,
+                    ..
                 } => {
                     // Calculate progress percentage and number of LEDs to light up
                     let progress_leds = if chunk_count > 0 {
@@ -120,6 +228,14 @@ async fn led_task(mut leds: hal::Leds, bl_state: &'static Mutex<NoopRawMutex, Bl
                         led_pattern[i * 3 + 2] = bg_color[2];
                     }
                 }
+                BlState::InvalidApp => {
+                    // Invalid app state, display all dark red
+                    for i in 0..10 {
+                        led_pattern[i * 3] = 0x00; // G
+                        led_pattern[i * 3 + 1] = 0x10; // R
+                        led_pattern[i * 3 + 2] = 0x00; // B
+                    }
+                }
                 _ => {
                     // Not in CodeWrite state, display all dark blue
                     for i in 0..10 {
@@ -145,38 +261,91 @@ async fn flash_writer_task(
     flash: &'static Mutex<NoopRawMutex, Flash>,
     bl_state: &'static Mutex<NoopRawMutex, BlState>,
 ) {
+    let app_flash_start = unsafe { (&_sapp_usr as *const ()) as u32 };
+
     loop {
         let msg = flash_channel.receive().await;
 
         defmt::debug!("Receive chunk");
 
-        let mut chunk_index = {
+        let (mut chunk_index, mut crc32_digest) = {
             let bl_state = bl_state
                 .try_lock()
                 .expect("bl_state lock should not be held across .awaits");
-            match *bl_state {
-                BlState::CodeWrite { chunk_index, .. } => chunk_index,
-                _ => 0,
+            match &*bl_state {
+                BlState::CodeWrite {
+                    chunk_index,
+                    crc32_digest,
+                    ..
+                } => (*chunk_index, crc32_digest.clone()),
+                _ => (0, CRC.digest()),
             }
         };
 
         let stalled;
         if msg.chunk_index == chunk_index {
-            let mut flash = flash
-                .try_lock()
-                .expect("flash lock should not be held across .awaits");
-            let address = 0x08008000 + 256 * msg.chunk_index; // TODO use linker symbol
-            flash.write_page(address, &msg.chunk_data).await;
-            chunk_index = msg.chunk_index + 1;
-            stalled = false;
-            defmt::info!("Write OK!");
+            // Check if non-final chunks are full (256 bytes)
+            let is_last_chunk = msg.chunk_index == msg.chunk_count;
+
+            if msg.chunk_data.len() == 256 || is_last_chunk {
+                let mut flash = flash
+                    .try_lock()
+                    .expect("flash lock should not be held across .awaits");
+                let address = app_flash_start + 256 * msg.chunk_index;
+                flash.write_page(address, &msg.chunk_data).await;
+
+                // Update CRC with the written chunk data
+                crc32_digest.update(&msg.chunk_data);
+
+                chunk_index = msg.chunk_index + 1;
+                stalled = false;
+                defmt::info!("Write OK!");
+
+                // Check if this was the last chunk
+                if chunk_index == msg.chunk_count {
+                    let firmware_crc32 = crc32_digest.clone().finalize();
+                    let firmware_size_bytes = msg.chunk_count * 256;
+
+                    defmt::info!(
+                        "Firmware complete! Size: {} bytes, CRC32: 0x{:08X}",
+                        firmware_size_bytes,
+                        firmware_crc32
+                    );
+
+                    // Create the bootloader config struct
+                    let config = BootloaderConfig {
+                        magic: BOOTLOADER_CONFIG_MAGIC,
+                        firmware_size_bytes,
+                        firmware_crc32,
+                    };
+
+                    // Write the config to flash at BOOTLOADER_CONFIG_USR address
+                    let config_bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            &config as *const BootloaderConfig as *const u8,
+                            core::mem::size_of::<BootloaderConfig>(),
+                        )
+                    };
+
+                    let config_address = &BOOTLOADER_CONFIG as *const BootloaderConfig as u32;
+                    flash.write_page(config_address, config_bytes).await;
+                    defmt::info!("Bootloader config written to flash");
+                }
+            } else {
+                // Non-final chunk is not full, mark as stalled
+                stalled = true;
+                defmt::warn!(
+                    "Chunk {} is not full ({} bytes), expected 256",
+                    msg.chunk_index,
+                    msg.chunk_data.len()
+                );
+            }
         } else if msg.chunk_index > chunk_index {
-            // We have fallen behind
             stalled = true;
-            defmt::info!("Wrong chunk");
+            defmt::info!("We have fallen behind");
         } else {
-            // We are ahead
             stalled = false;
+            defmt::info!("We are ahead");
         }
         let mut bl_state = bl_state
             .try_lock()
@@ -185,6 +354,7 @@ async fn flash_writer_task(
             chunk_index,
             chunk_count: msg.chunk_count,
             stalled,
+            crc32_digest,
         };
     }
 }
@@ -247,15 +417,10 @@ async fn rx_task(
                                 let CommState { seq_num, type_ } = &mut *comm_state;
                                 match type_ {
                                     CommType::Unknown => {
-                                        // Reboot into app
-                                        if bl_branch_enabled!() {
-                                            defmt::info!("Branching to app...");
-                                            // Safety: we are not in an interrupt
-                                            unsafe {
-                                                hal::branch_to_app();
-                                            }
-                                        } else {
-                                            defmt::info!("Branch to app disabled");
+                                        // Validate and reboot into app
+                                        // Safety: we are not in an interrupt
+                                        unsafe {
+                                            validate_and_branch_to_app(&mut *bl_state);
                                         }
                                     }
                                     CommType::BlInit => {
@@ -410,6 +575,8 @@ fn main() -> ! {
         flash,
     } = Hardware::init();
 
+    defmt::info!("Bootloader started");
+
     led_pwr.set_pwr(true);
 
     // Create executor
@@ -443,7 +610,7 @@ fn main() -> ! {
     ));
 
     executor.run(|spawner| {
-        spawner.spawn(branch_task(did_receive_packet).unwrap());
+        spawner.spawn(branch_task(did_receive_packet, bl_state).unwrap());
         spawner.spawn(led_task(leds, bl_state).unwrap());
         spawner.spawn(flash_writer_task(flash_channel, flash, bl_state).unwrap());
         for (name, rx) in [

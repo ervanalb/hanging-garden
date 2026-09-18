@@ -14,3 +14,11 @@ REGION_ALIAS("REGION_HEAP", RAM);
 REGION_ALIAS("REGION_STACK", RAM);
 
 PROVIDE(_sflash = ORIGIN(FLASH));
+
+SECTIONS
+{
+    .bootloader_config_usr (NOLOAD) : ALIGN(4)
+    {
+        *(.bootloader_config_usr .bootloader_config_usr.*);
+    } > BOOTLOADER_CONFIG_USR
+} INSERT AFTER .data;
