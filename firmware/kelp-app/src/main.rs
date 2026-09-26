@@ -50,7 +50,7 @@ fn gamma_correct(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
 
 #[embassy_executor::task]
 async fn main_task(mut leds: Leds) {
-    const NUM_PIXELS: usize = 30;
+    const NUM_PIXELS: usize = 120;
     const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
 
     let mut buffer = [0u8; NUM_PIXELS * 3];

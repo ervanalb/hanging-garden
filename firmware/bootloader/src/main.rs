@@ -282,10 +282,16 @@ async fn flash_writer_task(
             }
         };
 
+        if chunk_index >= msg.chunk_count {
+            defmt::warn!("chunk_index >= chunk_count, resetting chunk_index to 0");
+            chunk_index = 0;
+        }
+
         let stalled;
+
         if msg.chunk_index == chunk_index {
             // Check if non-final chunks are full (256 bytes)
-            let is_last_chunk = msg.chunk_index == msg.chunk_count;
+            let is_last_chunk = msg.chunk_index == msg.chunk_count - 1;
 
             if msg.chunk_data.len() == 256 || is_last_chunk {
                 let mut flash = flash
@@ -304,7 +310,7 @@ async fn flash_writer_task(
                 // Check if this was the last chunk
                 if chunk_index == msg.chunk_count {
                     let firmware_crc32 = crc32_digest.clone().finalize();
-                    let firmware_size_bytes = msg.chunk_count * 256;
+                    let firmware_size_bytes = (msg.chunk_count - 1) * 256 + msg.chunk_data.len() as u32;
 
                     defmt::info!(
                         "Firmware complete! Size: {} bytes, CRC32: 0x{:08X}",
