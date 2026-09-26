@@ -95,11 +95,11 @@ impl CommState {
 }
 
 pub const COMM_TYPE_INIT: u8 = 0x00;
-pub const COMM_TYPE_UNKNOWN: u8 = 0x7F;
-pub const COMM_TYPE_BL_INIT: u8 = 0x80;
-pub const COMM_TYPE_BL_BROADCAST_PING: u8 = 0x81;
-pub const COMM_TYPE_BL_CODE_WRITE: u8 = 0x82;
-pub const COMM_TYPE_BL_CODE_PROGRESS: u8 = 0x83;
+pub const COMM_TYPE_UNKNOWN: u8 = 0xEF;
+pub const COMM_TYPE_BL_INIT: u8 = 0xF0;
+pub const COMM_TYPE_BL_BROADCAST_PING: u8 = 0xF1;
+pub const COMM_TYPE_BL_CODE_WRITE: u8 = 0xF2;
+pub const COMM_TYPE_BL_CODE_PROGRESS: u8 = 0xF3;
 pub const COMM_TYPE_BL_UNKNOWN: u8 = 0xFF;
 
 #[cfg(test)]
@@ -522,8 +522,8 @@ impl<'de> Deserialize<'de> for CommType {
                     COMM_TYPE_BL_INIT => Ok(CommType::BlInit),
                     COMM_TYPE_BL_UNKNOWN => Ok(CommType::BlUnknown),
                     _ => {
-                        // Unknown variant - return appropriate Unknown variant based on bit 0x40
-                        if (discriminant & COMM_TYPE_BL_BITMASK) != 0 {
+                        // Unknown variant - return appropriate Unknown variant based on high bits
+                        if (discriminant & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK {
                             Ok(CommType::BlUnknown)
                         } else {
                             Ok(CommType::Unknown)
@@ -565,7 +565,7 @@ impl<'de> Deserialize<'de> for CommType {
                     _ => {
                         // Unknown variant - consume any remaining data and return appropriate Unknown variant
                         let _ = seq.next_element::<de::IgnoredAny>();
-                        if (discriminant & COMM_TYPE_BL_BITMASK) != 0 {
+                        if (discriminant & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK {
                             Ok(CommType::BlUnknown)
                         } else {
                             Ok(CommType::Unknown)
@@ -634,7 +634,8 @@ impl BlBroadcastPing {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, defmt::Format)]
 pub struct BlCodeWrite {
     pub hardware_id: u32,
-    pub chunk_count: u32,
+    pub firmware_size_bytes: u32,
+    pub firmware_crc32: u32,
     pub chunk_index: u32,
     pub chunk_data: heapless::Vec<u8, 256>,
 }
@@ -745,7 +746,8 @@ mod tests {
             seq_num: 1000,
             type_: CommType::BlCodeWrite(BlCodeWrite {
                 hardware_id: 0xDEADBEEF,
-                chunk_count: 100,
+                firmware_size_bytes: 25600,
+                firmware_crc32: 0x12345678,
                 chunk_index: 42,
                 chunk_data,
             }),
@@ -759,7 +761,8 @@ mod tests {
         assert_eq!(state.seq_num, deserialized.seq_num);
         if let CommType::BlCodeWrite(write) = deserialized.type_ {
             assert_eq!(write.hardware_id, 0xDEADBEEF);
-            assert_eq!(write.chunk_count, 100);
+            assert_eq!(write.firmware_size_bytes, 25600);
+            assert_eq!(write.firmware_crc32, 0x12345678);
             assert_eq!(write.chunk_index, 42);
             assert_eq!(write.chunk_data.len(), 4);
             assert_eq!(write.chunk_data[0], 0x01);
@@ -806,7 +809,8 @@ mod tests {
             seq_num: 99999,
             type_: CommType::BlCodeWrite(BlCodeWrite {
                 hardware_id: 0xCAFEBABE,
-                chunk_count: 200,
+                firmware_size_bytes: 51200,
+                firmware_crc32: 0xABCDEF00,
                 chunk_index: 150,
                 chunk_data,
             }),
@@ -821,7 +825,8 @@ mod tests {
         assert_eq!(state.seq_num, deserialized.seq_num);
         if let CommType::BlCodeWrite(write) = deserialized.type_ {
             assert_eq!(write.hardware_id, 0xCAFEBABE);
-            assert_eq!(write.chunk_count, 200);
+            assert_eq!(write.firmware_size_bytes, 51200);
+            assert_eq!(write.firmware_crc32, 0xABCDEF00);
             assert_eq!(write.chunk_index, 150);
             assert_eq!(write.chunk_data.len(), write.chunk_data.capacity());
             for i in 0..write.chunk_data.len() {

@@ -9,3 +9,4 @@ tokio-serial = "5.4"
 proto = { path = "../proto" }
 trickle = { path = "../trickle", features = ["impl-std"] }
 heapless = "0.9"
+crc = "3.2"

@@ -14,9 +14,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
+use pac::adc::vals::{Extsel, SampleTime};
 use pac::dma::vals::{Dir, Pl, Size};
 use pac::gpio::vals::{Cnf, Mode};
-use pac::rcc::vals::{Hpre, PllMul, Ppre, Sw};
+use pac::rcc::vals::{Adcpre, Hpre, PllMul, Ppre, Sw};
 use pac::spi::vals::BaudRate;
 use pac::systick::vals;
 
@@ -453,7 +454,13 @@ unsafe fn init_usart_halfduplex(
     }
 
     // Configure USART for half-duplex mode at 1 Mbaud
-    usart.brr().write_value(pac::usart::regs::Brr(60));
+    // USART1 is on APB2 (60 MHz), others on APB1 (120 MHz)
+    let brr_val = if usart.as_ptr() == pac::USART1.as_ptr() {
+        30 // APB2 @ 60 MHz
+    } else {
+        60 // APB1 @ 120 MHz
+    };
+    usart.brr().write_value(pac::usart::regs::Brr(brr_val));
 
     usart.ctlr1().modify(|w| {
         w.set_m(false); // 8 data bits
@@ -591,6 +598,7 @@ pub struct Hardware {
     pub usarts_tx: [UsartTx; 4],
     pub usarts_rx: [UsartRx; 4],
     pub flash: Flash,
+    pub watchdog: Watchdog,
 }
 
 impl Hardware {
@@ -607,11 +615,11 @@ impl Hardware {
             w.set_pllmul(PllMul::MUL15); // PLL multiplier x15
         });
 
-        // Configure bus prescalers (all DIV1)
+        // Configure bus prescalers
         pac::RCC.cfgr0().modify(|w| {
-            w.set_hpre(Hpre::DIV1); // AHB prescaler = 1
-            w.set_ppre1(Ppre::DIV1); // APB1 prescaler = 1
-            w.set_ppre2(Ppre::DIV1); // APB2 prescaler = 1
+            w.set_hpre(Hpre::DIV1); // AHB prescaler = 1 (120 MHz)
+            w.set_ppre1(Ppre::DIV1); // APB1 prescaler = 1 (120 MHz)
+            w.set_ppre2(Ppre::DIV2); // APB2 prescaler = 2 (60 MHz - to get ADC under 14MHz)
         });
 
         // Enable PLL
@@ -644,6 +652,7 @@ impl Hardware {
             w.set_afioen(true); // AFIO clock
             w.set_spi1en(true); // SPI1 clock
             w.set_usart1en(true); // USART1 clock
+            w.set_adc1en(true); // ADC1 clock
         });
         pac::RCC.apb1pcenr().modify(|w| {
             w.set_usart2en(true); // USART2 clock
@@ -660,14 +669,22 @@ impl Hardware {
             riscv::asm::delay(100000);
         }
 
+        // PA6 and PA7 are ADC inputs for current and voltage sensing
+        // Configure as analog inputs
+        pac::GPIOA.cfglr().modify(|w| {
+            w.set_mode(6, Mode::INPUT);
+            w.set_cnf(6, Cnf::ANALOG_IN__PUSH_PULL_OUT);
+            w.set_mode(7, Mode::INPUT);
+            w.set_cnf(7, Cnf::ANALOG_IN__PUSH_PULL_OUT);
+        });
+
         // PB3 enables LED power when high
-        // Configure as push-pull output, 50 MHz
         // Start with it HIGH (power disabled)
         pac::GPIOB.bshr().write(|w| w.set_bs(3, true));
         compiler_fence(Ordering::SeqCst);
         pac::GPIOB.cfglr().modify(|w| {
             w.set_mode(3, Mode::OUTPUT_50MHZ);
-            w.set_cnf(3, Cnf::ANALOG_IN__PUSH_PULL_OUT);
+            w.set_cnf(3, Cnf::FLOATING_IN__OPEN_DRAIN_OUT);
         });
 
         // Configure SPI1 pins for WS2812 output
@@ -681,13 +698,13 @@ impl Hardware {
             w.set_spi1_rm(true);
         });
 
-        // APB2 = 120 MHz, desired SPI clock = 3.2 MHz
-        // 120 MHz / 16 / 2 = 3.75 MHz (closest to 3.2 MHz)
+        // APB2 = 60 MHz, desired SPI clock = 3.2 MHz
+        // 60 MHz / 8 / 2 = 3.75 MHz (closest to 3.2 MHz)
         pac::SPI1.ctlr1().modify(|w| {
             w.set_cpha(false); // Clock phase: first edge
             w.set_cpol(false); // Clock polarity: low when idle
             w.set_mstr(true); // Master mode
-            w.set_br(BaudRate::DIV_16); // Baud rate
+            w.set_br(BaudRate::DIV_8); // Baud rate
             w.set_spe(false); // SPI disabled during configuration
             w.set_lsbfirst(false); // MSB first
             w.set_ssi(true); // Internal slave select high
@@ -802,13 +819,70 @@ impl Hardware {
         // > - Either `WFITOWFE` or `SEVONPEND` must be enabled for proper wake-up behavior
         pac::PFIC.sctlr().modify(|w| w.set_sevonpend(true));
 
-        compiler_fence(Ordering::SeqCst);
-
         // Enable SPI1
         pac::SPI1.ctlr1().modify(|w| w.set_spe(true));
 
-        compiler_fence(Ordering::SeqCst);
+        // Initialize ADC1
+        // Reset ADC1
+        pac::RCC.apb2prstr().modify(|w| w.set_adc1rst(true));
+        pac::RCC.apb2prstr().modify(|w| w.set_adc1rst(false));
 
+        // Configure ADC clock: APB2/6 = 60MHz/6 = 10MHz (under 14MHz spec)
+        pac::RCC.cfgr0().modify(|w| w.set_adcpre(Adcpre::DIV6));
+
+        // Power on ADC and enable it
+        pac::ADC1.ctlr2().modify(|w| {
+            w.set_adon(true); // ADC enable
+        });
+
+        // Wait for ADC to stabilize (typically a few microseconds)
+        riscv::asm::delay(1000);
+
+        // Calibrate ADC
+        pac::ADC1.ctlr2().modify(|w| w.set_cal(true));
+        while pac::ADC1.ctlr2().read().cal() {} // Wait for calibration to complete
+
+        // Configure ADC for single conversion mode
+        pac::ADC1.ctlr1().modify(|w| {
+            w.set_scan(false); // Single channel mode
+        });
+        pac::ADC1.ctlr2().modify(|w| {
+            w.set_cont(false); // Single conversion mode (not continuous)
+            w.set_align(false); // Right alignment
+            w.set_exttrig(true); // Enable external trigger
+            w.set_extsel(Extsel::SWSTART); // Software trigger (SWSTART)
+        });
+
+        // Set sample time for channels 6 and 7 (13.5 cycles)
+        pac::ADC1.samptr2().modify(|w| {
+            w.set_smp(6, SampleTime::CYCLES13_5);
+            w.set_smp(7, SampleTime::CYCLES13_5);
+        });
+
+        // Set sequence length to 1 (single channel conversion)
+        pac::ADC1.rsqr1().modify(|w| w.set_l(0)); // 1 conversion
+
+        // Initialize Independent Watchdog (IWDG)
+        // LSI clock = 40 kHz
+        // Prescaler = 64 (PR = 0b100)
+        // Counter clock = 40000 / 64 = 625 Hz
+        // Reload value = 2500 (0x9C4)
+        // Timeout = (2500 + 1) / 625 Hz = 4.0016 seconds
+
+        // Set prescaler to 64 (PR = 0b100)
+        while pac::IWDG.statr().read().pvu() {}
+        pac::IWDG.ctlr().write(|w| w.set_key(0x5555));
+        pac::IWDG.pscr().write(|w| w.set_pr(0b100));
+
+        // Set reload value to 2500 for ~4 second timeout
+        while pac::IWDG.statr().read().rvu() {}
+        pac::IWDG.ctlr().write(|w| w.set_key(0x5555));
+        pac::IWDG.rldr().write(|w| w.set_rl(2500));
+
+        // Start the watchdog
+        pac::IWDG.ctlr().write(|w| w.set_key(0xCCCC));
+
+        // Return hardware handles
         Hardware {
             leds: Leds {},
             led_pwr: LedPwr {},
@@ -854,6 +928,7 @@ impl Hardware {
                 },
             ],
             flash: Flash {},
+            watchdog: Watchdog {},
         }
     }
 }
@@ -1183,6 +1258,57 @@ impl LedPwr {
         } else {
             pac::GPIOB.bshr().write(|w| w.set_bs(3, true));
         }
+    }
+
+    /// Read current sensor on PA6 (ADC6)
+    /// Returns raw ADC value (0-4095 for 12-bit ADC)
+    pub async fn read_current(&mut self) -> u16 {
+        self.read_adc_channel(6).await
+    }
+
+    /// Read voltage sensor on PA7 (ADC7)
+    /// Returns raw ADC value (0-4095 for 12-bit ADC)
+    pub async fn read_voltage(&mut self) -> u16 {
+        self.read_adc_channel(7).await
+    }
+
+    /// Internal helper to read a specific ADC channel
+    async fn read_adc_channel(&mut self, channel: u8) -> u16 {
+        // Set the channel in the first position of the regular sequence
+        pac::ADC1.rsqr3().modify(|w| w.set_sq(0, channel));
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Start conversion by setting SWSTART
+        pac::ADC1.ctlr2().modify(|w| w.set_swstart(true));
+
+        // Wait for conversion to complete (busy wait with yield)
+        while !pac::ADC1.statr().read().eoc() {
+            embassy_futures::yield_now().await;
+        }
+
+        // Read the result
+        let result = pac::ADC1.rdatar().read().data();
+
+        // Clear EOC flag by reading RDATAR (already done above)
+        compiler_fence(Ordering::SeqCst);
+
+        result
+    }
+}
+
+/// Independent Watchdog (IWDG) handle
+/// Feed is atomic, so no issues sharing this anywhere it is needed.
+#[derive(Clone, Copy)]
+pub struct Watchdog {}
+unsafe impl Send for Watchdog {}
+unsafe impl Sync for Watchdog {}
+
+impl Watchdog {
+    /// Feed the watchdog to prevent system reset
+    /// This reloads the counter with the value from IWDG_RLDR
+    pub fn feed(&self) {
+        pac::IWDG.ctlr().write(|w| w.set_key(0xAAAA));
     }
 }
 

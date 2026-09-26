@@ -133,6 +133,8 @@ const INITIAL_CODE_CHUNK_TIMEOUT: Duration = Duration::from_millis(100);
 const HARDWARE_ID: u32 = 1;
 const CHUNK_SIZE: usize = 256;
 
+static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -152,10 +154,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let chunk_count = (firmware_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    // Calculate CRC32 of the entire firmware
+    let mut digest = CRC.digest();
+    digest.update(&firmware_data);
+    let firmware_crc32 = digest.finalize();
+
     println!(
-        "Loaded firmware: {} bytes ({} chunks)",
+        "Loaded firmware: {} bytes ({} chunks), CRC32: 0x{:08X}",
         firmware_data.len(),
-        chunk_count
+        chunk_count,
+        firmware_crc32
     );
 
     // Open serial port
@@ -312,7 +321,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             seq_num,
                             type_: CommType::BlCodeWrite(BlCodeWrite {
                                 hardware_id: HARDWARE_ID,
-                                chunk_count: chunk_count as u32,
+                                firmware_size_bytes: firmware_data.len() as u32,
+                                firmware_crc32,
                                 chunk_index: chunk_index as u32,
                                 chunk_data: heapless::Vec::from_slice(chunk_data).unwrap(),
                             }),

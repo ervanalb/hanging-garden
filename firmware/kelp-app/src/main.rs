@@ -4,7 +4,7 @@
 use embassy_futures::join::join_array;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Hardware, Leds, UsartRx, UsartTx};
+use hal::{Hardware, Leds, UsartRx, UsartTx, Watchdog};
 use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
@@ -49,13 +49,14 @@ fn gamma_correct(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
 }
 
 #[embassy_executor::task]
-async fn main_task(mut leds: Leds) {
+async fn main_task(mut leds: Leds, watchdog: Watchdog) {
     const NUM_PIXELS: usize = 120;
     const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
 
     let mut buffer = [0u8; NUM_PIXELS * 3];
     let mut time_offset: u16 = 0;
 
+    Timer::after_millis(100).await; // Avoid startup state transients that may flash the LEDs
     loop {
         // Generate rainbow pattern
         for pixel in 0..NUM_PIXELS {
@@ -74,6 +75,8 @@ async fn main_task(mut leds: Leds) {
 
         // Update time offset for next frame
         time_offset = (time_offset + 16) % 1536;
+
+        watchdog.feed();
 
         Timer::after_millis(FRAME_INTERVAL_MS).await;
     }
@@ -164,6 +167,34 @@ async fn rx_task(
     }
 }
 
+#[embassy_executor::task]
+async fn led_pwr_task(mut led_pwr: hal::LedPwr) {
+    loop {
+        // Set LED power on
+        led_pwr.set_pwr(true);
+        Timer::after_millis(100).await; // Weather initial power-on transient
+
+        loop {
+            // Read current at 100Hz (every 10ms)
+            Timer::after_millis(10).await;
+            let current = led_pwr.read_current().await;
+
+            if current > 150 {
+                defmt::info!("Overcurrent detected: {}, shutting off LEDs", current);
+                break;
+            }
+        }
+
+        // Shut off LED power
+        led_pwr.set_pwr(false);
+
+        // Wait 1 second
+        Timer::after_secs(1).await;
+
+        defmt::info!("LEDs powered back on");
+    }
+}
+
 #[embassy_executor::task()]
 async fn tx_task(
     mut usarts_tx: [UsartTx; 4],
@@ -236,13 +267,12 @@ async fn tx_task(
 fn main() -> ! {
     let Hardware {
         leds,
-        mut led_pwr,
+        led_pwr,
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash: _,
+        watchdog,
     } = Hardware::init();
-
-    led_pwr.set_pwr(true);
 
     // Create executor
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
@@ -256,7 +286,8 @@ fn main() -> ! {
         STATE.init((comm_state, trickle_state, trickle_signal));
 
     executor.run(|spawner| {
-        spawner.spawn(main_task(leds).unwrap());
+        spawner.spawn(led_pwr_task(led_pwr).unwrap());
+        spawner.spawn(main_task(leds, watchdog).unwrap());
         spawner
             .spawn(rx_task("North", north_rx, comm_state, trickle_state, trickle_signal).unwrap());
         spawner
