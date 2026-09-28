@@ -359,52 +359,49 @@ async fn flash_writer_task(
                 chunk_count,
                 msg.firmware_size_bytes
             );
-        } else if msg.chunk_index == chunk_index {
-            let is_last_chunk = msg.chunk_index == chunk_count - 1;
-            let expected_chunk_size = if is_last_chunk {
-                let remainder = msg.firmware_size_bytes % 256;
-                if remainder == 0 {
-                    256
-                } else {
-                    remainder as usize
-                }
-            } else {
-                256
-            };
-
-            // Validate chunk size
-            if msg.chunk_data.len() != expected_chunk_size {
-                stalled = true;
-                defmt::warn!(
-                    "Chunk {} has size {} bytes, expected {} bytes",
-                    msg.chunk_index,
-                    msg.chunk_data.len(),
-                    expected_chunk_size
-                );
-            } else {
-                let mut flash = flash.lock().await;
-                let address = app_flash_start + 256 * msg.chunk_index;
-                flash.write_page(address, &msg.chunk_data).await;
-
-                chunk_index = msg.chunk_index + 1;
-                stalled = false;
-                defmt::info!("Write OK!");
-
-                // Check if this was the last chunk
-                if is_last_chunk {
-                    defmt::info!(
-                        "Firmware complete! Size: {} bytes, CRC32: 0x{:08X}",
-                        msg.firmware_size_bytes,
-                        msg.firmware_crc32
-                    );
-                }
-            }
-        } else if msg.chunk_index > chunk_index {
-            stalled = true;
-            defmt::info!("We have fallen behind");
         } else {
-            stalled = false;
-            defmt::info!("We are ahead");
+            defmt::info!(
+                "Flash write msg, chunk_index={:?} (ours is {:?})",
+                msg.chunk_index, chunk_index
+            );
+            if msg.chunk_index == chunk_index {
+                let is_last_chunk = msg.chunk_index == chunk_count - 1;
+                let expected_chunk_size = if is_last_chunk {
+                    let remainder = msg.firmware_size_bytes % 256;
+                    if remainder == 0 {
+                        256
+                    } else {
+                        remainder as usize
+                    }
+                } else {
+                    256
+                };
+
+                // Validate chunk size
+                if msg.chunk_data.len() != expected_chunk_size {
+                    stalled = true;
+                    defmt::warn!(
+                        "Chunk {} has size {} bytes, expected {} bytes",
+                        msg.chunk_index,
+                        msg.chunk_data.len(),
+                        expected_chunk_size
+                    );
+                } else {
+                    let mut flash = flash.lock().await;
+                    let address = app_flash_start + 256 * msg.chunk_index;
+                    flash.write_page(address, &msg.chunk_data).await;
+
+                    chunk_index = msg.chunk_index + 1;
+                    stalled = false;
+                    defmt::info!("Write OK!");
+                }
+            } else if msg.chunk_index > chunk_index {
+                stalled = true;
+                defmt::info!("We have fallen behind");
+            } else {
+                stalled = false;
+                defmt::info!("We are ahead");
+            }
         }
         let mut bl_state = bl_state
             .try_lock()
@@ -630,6 +627,7 @@ fn main() -> ! {
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash,
         watchdog,
+        chip_id,
     } = Hardware::init();
 
     defmt::info!("Bootloader started");
@@ -637,10 +635,11 @@ fn main() -> ! {
     // Create executor
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
 
-    // TODO: Initialize RNG with unique chip identifier
+    // Seed RNG with unique chip identifier
+    let seed = (((chip_id[0] as u64) << 32) | (chip_id[1] as u64)) ^ (chip_id[2] as u64);
     let now = Instant::now();
     let comm_state = Mutex::new(CommState::default());
-    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, 0));
+    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed));
     let trickle_signal = Signal::new();
     let did_receive_packet = Mutex::new(false);
     let bl_state = Mutex::new(BlState::Init);

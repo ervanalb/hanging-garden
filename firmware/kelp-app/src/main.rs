@@ -272,15 +272,17 @@ fn main() -> ! {
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash: _,
         watchdog,
+        chip_id,
     } = Hardware::init();
 
     // Create executor
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
 
-    // TODO: Initialize RNG with unique chip identifier
+    // Seed RNG with unique chip identifier
+    let seed = (((chip_id[0] as u64) << 32) | (chip_id[1] as u64)) ^ (chip_id[2] as u64);
     let now = Instant::now();
     let comm_state = Mutex::new(CommState::default());
-    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, 0));
+    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed));
     let trickle_signal = Signal::new();
     let (comm_state, trickle_state, trickle_signal) =
         STATE.init((comm_state, trickle_state, trickle_signal));

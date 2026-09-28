@@ -2,7 +2,7 @@ use proto::{
     BlBroadcastPing, BlCodeProgress, BlCodeWrite, CommState, CommType, MAX_PACKET_LEN,
     TRICKLE_PARAMS,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
@@ -40,7 +40,7 @@ async fn rx_task(
                     })
                 {
                     let now = Instant::now();
-                    //println!("RX: {:?}", received_comm_state);
+                    println!("RX: {:?}", received_comm_state);
                     // We got a valid packet--update the state
 
                     let mut trickle_state = trickle_state
@@ -108,7 +108,7 @@ async fn tx_task(
                     .try_lock()
                     .expect("comm_state lock cannot be held across an .await");
                 comm_state.update(now);
-                //println!("TX {:?}", &comm_state);
+                println!("TX: {:?}", &comm_state);
                 let mut tx_buffer = vec![0u8; MAX_PACKET_LEN + 1];
                 // We retain an initial '\0' to improve packet start detection
                 let len = comm_state.serialize_packet(&mut tx_buffer[1..]).len() + 1;
@@ -177,8 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize trickle state
     let now = Instant::now();
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let comm_state = Mutex::new(CommState::default());
-    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, 42)); // TODO: Seed
+    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed));
     let (trickle_notify_tx, trickle_notify_rx) = watch::channel(());
     let (new_comm_state_tx, mut new_comm_state_rx) = watch::channel(CommState::default());
 
@@ -196,41 +200,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut seq_num = 0;
         println!("Switching to bootloader...");
         let switch_to_bl = async {
+            {
+                let now = Instant::now();
+                let mut comm_state = comm_state
+                    .try_lock()
+                    .expect("comm_state lock cannot be held across an .await");
+                let mut trickle_state = trickle_state
+                    .try_lock()
+                    .expect("trickle_state lock cannot be held across an .await");
+                seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+                *comm_state = CommState {
+                    seq_num,
+                    type_: CommType::BlInit,
+                };
+                comm_state.update(now);
+                trickle_state.got_new_state(now);
+                let _ = trickle_notify_tx.send(());
+            }
             loop {
-                {
-                    let now = Instant::now();
+                new_comm_state_rx.changed().await.unwrap(); // TODO real error handling here
+                let new_comm_state = new_comm_state_rx.borrow_and_update();
+                if new_comm_state.seq_num > seq_num {
+                    // Update with higher seq_num:
+                    // One-up the message with an even higher seq_num
                     let mut comm_state = comm_state
                         .try_lock()
                         .expect("comm_state lock cannot be held across an .await");
                     let mut trickle_state = trickle_state
                         .try_lock()
                         .expect("trickle_state lock cannot be held across an .await");
-                    seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
                     *comm_state = CommState {
-                        seq_num,
+                        seq_num: new_comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT,
                         type_: CommType::BlInit,
                     };
-                    comm_state.update(now);
                     trickle_state.got_new_state(now);
                     let _ = trickle_notify_tx.send(());
-                }
-                loop {
-                    new_comm_state_rx.changed().await.unwrap(); // TODO real error handling here
-                    let new_comm_state = new_comm_state_rx.borrow_and_update();
-                    if new_comm_state.seq_num > seq_num {
-                        break; // Send the message again with higher seq num
-                    } else {
-                        // Basic update
-                        let mut comm_state = comm_state
-                            .try_lock()
-                            .expect("comm_state lock cannot be held across an .await");
-                        let mut trickle_state = trickle_state
-                            .try_lock()
-                            .expect("trickle_state lock cannot be held across an .await");
-                        *comm_state = new_comm_state.clone();
-                        trickle_state.got_new_state(now);
-                        let _ = trickle_notify_tx.send(());
-                    }
+                } else {
+                    // Basic update
+                    let mut comm_state = comm_state
+                        .try_lock()
+                        .expect("comm_state lock cannot be held across an .await");
+                    let mut trickle_state = trickle_state
+                        .try_lock()
+                        .expect("trickle_state lock cannot be held across an .await");
+                    *comm_state = new_comm_state.clone();
+                    trickle_state.got_new_state(now);
+                    let _ = trickle_notify_tx.send(());
                 }
             }
         };
@@ -298,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             " - Measured latency: {} milliseconds",
             latency_micros / 1_000
         );
+
         let mut code_chunk_timeout = INITIAL_CODE_CHUNK_TIMEOUT;
         let mut first_chunk = 0;
 
@@ -426,7 +442,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 // Need to retransmit some chunks
                 first_chunk = chunk_count_progress as usize;
-                code_chunk_timeout *= 2;
+                code_chunk_timeout =
+                    Duration::from_secs_f64(code_chunk_timeout.as_secs_f64() * 1.2);
             }
         }
 

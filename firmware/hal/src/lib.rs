@@ -34,7 +34,7 @@ unsafe extern "C" {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     defmt::error!("*** PANIC ***");
-    defmt::debug!("{}", defmt::Display2Format(info));
+    //defmt::debug!("{}", defmt::Display2Format(info));
     loop {}
 }
 
@@ -342,14 +342,14 @@ static USART3_RX_WAKER: AtomicWaker = AtomicWaker::new();
 static USART4_RX_WAKER: AtomicWaker = AtomicWaker::new();
 
 // USART RX circular DMA buffers
-const USART_RX_DMA_BUFFER_SIZE: usize = 512;
+const USART_RX_DMA_BUFFER_SIZE: usize = 64;
 static mut USART1_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 static mut USART2_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 static mut USART3_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 static mut USART4_RX_DMA_BUFFER: [u8; USART_RX_DMA_BUFFER_SIZE] = [0; USART_RX_DMA_BUFFER_SIZE];
 
 // USART RX fring buffers
-pub const USART_RX_CAPACITY: usize = 1024;
+pub const USART_RX_CAPACITY: usize = 512;
 static USART1_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
 static USART2_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
 static USART3_RX_FRING: fring::Buffer<u8, USART_RX_CAPACITY> = fring::Buffer::new();
@@ -599,6 +599,7 @@ pub struct Hardware {
     pub usarts_rx: [UsartRx; 4],
     pub flash: Flash,
     pub watchdog: Watchdog,
+    pub chip_id: [u32; 3],
 }
 
 impl Hardware {
@@ -882,6 +883,18 @@ impl Hardware {
         // Start the watchdog
         pac::IWDG.ctlr().write(|w| w.set_key(0xCCCC));
 
+        // Read 96-bit unique chip ID from ESIG registers
+        // UNIID1 at 0x1FFFF7E8 - 32 bits
+        // UNIID2 at 0x1FFFF7EC - 32 bits
+        // UNIID3 at 0x1FFFF7F0 - 32 bits
+        let chip_id = unsafe {
+            [
+                core::ptr::read_volatile(0x1FFF_F7E8 as *const u32),
+                core::ptr::read_volatile(0x1FFF_F7EC as *const u32),
+                core::ptr::read_volatile(0x1FFF_F7F0 as *const u32),
+            ]
+        };
+
         // Return hardware handles
         Hardware {
             leds: Leds {},
@@ -929,6 +942,7 @@ impl Hardware {
             ],
             flash: Flash {},
             watchdog: Watchdog {},
+            chip_id,
         }
     }
 }
