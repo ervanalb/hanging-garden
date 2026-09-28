@@ -36,7 +36,7 @@ use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Flash, Hardware, UsartRx, UsartTx, Watchdog};
+use hal::{Flash, HARDWARE_ID, Hardware, UsartRx, UsartTx, Watchdog};
 use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
@@ -362,7 +362,8 @@ async fn flash_writer_task(
         } else {
             defmt::info!(
                 "Flash write msg, chunk_index={:?} (ours is {:?})",
-                msg.chunk_index, chunk_index
+                msg.chunk_index,
+                chunk_index
             );
             if msg.chunk_index == chunk_index {
                 let is_last_chunk = msg.chunk_index == chunk_count - 1;
@@ -500,7 +501,10 @@ async fn rx_task(
                                     }
                                     CommType::BlCodeWrite(bl_code_write) => {
                                         // Send the flash write message to the flash writer task
-                                        let _ = flash_channel.try_send(bl_code_write.clone());
+                                        // if this message is for us (hardware ID matches)
+                                        if bl_code_write.hardware_id == HARDWARE_ID {
+                                            let _ = flash_channel.try_send(bl_code_write.clone());
+                                        }
                                     }
                                     CommType::BlCodeProgress(bl_code_progress) => {
                                         let chunk_index = match *bl_state {
@@ -622,12 +626,13 @@ async fn tx_task(
 fn main() -> ! {
     let Hardware {
         leds,
-        mut led_pwr,
+        led_pwr,
         usarts_tx,
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash,
         watchdog,
         chip_id,
+        touch: _,
     } = Hardware::init();
 
     defmt::info!("Bootloader started");

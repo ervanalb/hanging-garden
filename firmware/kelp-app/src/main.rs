@@ -4,7 +4,7 @@
 use embassy_futures::join::join_array;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Hardware, Leds, UsartRx, UsartTx, Watchdog};
+use hal::{Hardware, Leds, Touch, UsartRx, UsartTx, Watchdog};
 use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
@@ -48,23 +48,78 @@ fn gamma_correct(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
     (r, g / 4, b / 4)
 }
 
+struct TouchState {
+    last: u16,
+    last_touched: bool,
+}
+
+impl TouchState {
+    fn new() -> Self {
+        TouchState {
+            last: u16::MAX,
+            last_touched: false,
+        }
+    }
+
+    async fn update(&mut self, touch: &mut Touch) -> bool {
+        const BASE: u32 = 16384;
+        const UP_ALPHA: f32 = 0.1;
+        const DOWN_ALPHA: f32 = 0.01;
+        const THRESH_TOUCH: f32 = 0.75;
+        const THRESH_RELEASE: f32 = 0.9;
+
+        let val = touch.read().await;
+
+        if self.last >= 4096 {
+            self.last = val;
+            self.last_touched = false;
+            return false;
+        }
+
+        let alpha: u16 = if val > self.last {
+            const { (UP_ALPHA * BASE as f32) as u16 }
+        } else {
+            const { (DOWN_ALPHA * BASE as f32) as u16 }
+        };
+
+        self.last = (self.last as i32
+            + alpha as i32 * (val as i32 - self.last as i32) as i32 / BASE as i32)
+            as u16;
+
+        let thresh = if self.last_touched {
+            const { (THRESH_RELEASE * BASE as f32) as u16 }
+        } else {
+            const { (THRESH_TOUCH * BASE as f32) as u16 }
+        };
+
+        let touched = val < (self.last as u32 * thresh as u32 / BASE) as u16;
+        self.last_touched = touched;
+
+        touched
+    }
+}
+
 #[embassy_executor::task]
-async fn main_task(mut leds: Leds, watchdog: Watchdog) {
+async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog) {
     const NUM_PIXELS: usize = 120;
     const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
 
     let mut buffer = [0u8; NUM_PIXELS * 3];
     let mut time_offset: u16 = 0;
 
+    let mut touch_state = TouchState::new();
+
     Timer::after_millis(100).await; // Avoid startup state transients that may flash the LEDs
     loop {
+        let touched = touch_state.update(&mut touch).await;
+
         // Generate rainbow pattern
         for pixel in 0..NUM_PIXELS {
             // Hue varies with position: spread across full color wheel
-            let position_hue = (pixel as u16 * 1536 / NUM_PIXELS as u16) as u16;
+            let position_hue = (pixel * 1536 / NUM_PIXELS) as u16;
             let hue = (position_hue + time_offset) % 1536;
 
-            let (r, g, b) = gamma_correct(hsv2rgb(hue, 255, 25));
+            let (r, g, b) = gamma_correct(hsv2rgb(hue as u16, 255, if touched { 100 } else { 25 }));
 
             buffer[pixel * 3] = g;
             buffer[pixel * 3 + 1] = r;
@@ -77,7 +132,6 @@ async fn main_task(mut leds: Leds, watchdog: Watchdog) {
         time_offset = (time_offset + 16) % 1536;
 
         watchdog.feed();
-
         Timer::after_millis(FRAME_INTERVAL_MS).await;
     }
 }
@@ -273,6 +327,7 @@ fn main() -> ! {
         flash: _,
         watchdog,
         chip_id,
+        touch,
     } = Hardware::init();
 
     // Create executor
@@ -289,7 +344,7 @@ fn main() -> ! {
 
     executor.run(|spawner| {
         spawner.spawn(led_pwr_task(led_pwr).unwrap());
-        spawner.spawn(main_task(leds, watchdog).unwrap());
+        spawner.spawn(main_task(leds, touch, watchdog).unwrap());
         spawner
             .spawn(rx_task("North", north_rx, comm_state, trickle_state, trickle_signal).unwrap());
         spawner

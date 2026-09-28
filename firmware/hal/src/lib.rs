@@ -30,11 +30,14 @@ unsafe extern "C" {
     static _eusr: ();
 }
 
+// Hardware ID constant
+pub const HARDWARE_ID: u32 = 1;
+
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     defmt::error!("*** PANIC ***");
-    //defmt::debug!("{}", defmt::Display2Format(info));
+    defmt::debug!("{}", defmt::Display2Format(info));
     loop {}
 }
 
@@ -595,6 +598,7 @@ impl UsartRx {
 pub struct Hardware {
     pub leds: Leds,
     pub led_pwr: LedPwr,
+    pub touch: Touch,
     pub usarts_tx: [UsartTx; 4],
     pub usarts_rx: [UsartRx; 4],
     pub flash: Flash,
@@ -654,6 +658,7 @@ impl Hardware {
             w.set_spi1en(true); // SPI1 clock
             w.set_usart1en(true); // USART1 clock
             w.set_adc1en(true); // ADC1 clock
+            w.set_adc2en(true); // ADC2 clock for TKEY
         });
         pac::RCC.apb1pcenr().modify(|w| {
             w.set_usart2en(true); // USART2 clock
@@ -670,9 +675,14 @@ impl Hardware {
             riscv::asm::delay(100000);
         }
 
-        // PA6 and PA7 are ADC inputs for current and voltage sensing
+        // PA1, PA6 and PA7 are ADC inputs
+        // PA1: Touch key detection (ADC2_IN1)
+        // PA6: Current sensor (ADC1_IN6)
+        // PA7: Voltage sensor (ADC1_IN7)
         // Configure as analog inputs
         pac::GPIOA.cfglr().modify(|w| {
+            w.set_mode(1, Mode::INPUT);
+            w.set_cnf(1, Cnf::ANALOG_IN__PUSH_PULL_OUT);
             w.set_mode(6, Mode::INPUT);
             w.set_cnf(6, Cnf::ANALOG_IN__PUSH_PULL_OUT);
             w.set_mode(7, Mode::INPUT);
@@ -823,33 +833,31 @@ impl Hardware {
         // Enable SPI1
         pac::SPI1.ctlr1().modify(|w| w.set_spe(true));
 
-        // Initialize ADC1
-        // Reset ADC1
-        pac::RCC.apb2prstr().modify(|w| w.set_adc1rst(true));
-        pac::RCC.apb2prstr().modify(|w| w.set_adc1rst(false));
-
+        // Initialize ADC1&2
         // Configure ADC clock: APB2/6 = 60MHz/6 = 10MHz (under 14MHz spec)
         pac::RCC.cfgr0().modify(|w| w.set_adcpre(Adcpre::DIV6));
 
         // Power on ADC and enable it
         pac::ADC1.ctlr2().modify(|w| {
-            w.set_adon(true); // ADC enable
+            w.set_adon(true);
+        });
+        pac::ADC2.ctlr2().modify(|w| {
+            w.set_adon(true);
         });
 
         // Wait for ADC to stabilize (typically a few microseconds)
         riscv::asm::delay(1000);
 
-        // Calibrate ADC
+        // Calibrate ADC1
         pac::ADC1.ctlr2().modify(|w| w.set_cal(true));
         while pac::ADC1.ctlr2().read().cal() {} // Wait for calibration to complete
 
+        // Calibrate ADC2
+        pac::ADC2.ctlr2().modify(|w| w.set_cal(true));
+        while pac::ADC2.ctlr2().read().cal() {} // Wait for calibration to complete
+
         // Configure ADC for single conversion mode
-        pac::ADC1.ctlr1().modify(|w| {
-            w.set_scan(false); // Single channel mode
-        });
         pac::ADC1.ctlr2().modify(|w| {
-            w.set_cont(false); // Single conversion mode (not continuous)
-            w.set_align(false); // Right alignment
             w.set_exttrig(true); // Enable external trigger
             w.set_extsel(Extsel::SWSTART); // Software trigger (SWSTART)
         });
@@ -862,6 +870,26 @@ impl Hardware {
 
         // Set sequence length to 1 (single channel conversion)
         pac::ADC1.rsqr1().modify(|w| w.set_l(0)); // 1 conversion
+
+        // Enable TKEY mode in ADC2
+        pac::ADC2.ctlr1().modify(|w| {
+            w.set_tkenable(true); // Enable touch key detection
+        });
+
+        // Set charge time
+        pac::ADC2.samptr2().modify(|w| {
+            w.set_smp(1, SampleTime::CYCLES28_5);
+        });
+
+        // Set sequence length to 1 (single channel conversion)
+        pac::ADC2.rsqr1().modify(|w| w.set_l(0)); // 1 conversion
+
+        // Set channel 1 (PA1) in the first position of the regular sequence
+        pac::ADC2.rsqr3().modify(|w| w.set_sq(0, 1));
+
+        // Set charge offset time
+        //let tkey2 = unsafe { pac::adc::Tkey::from_ptr(pac::ADC2.as_ptr()) };
+        //tkey2.chgoffset().write_value(0);
 
         // Initialize Independent Watchdog (IWDG)
         // LSI clock = 40 kHz
@@ -899,6 +927,7 @@ impl Hardware {
         Hardware {
             leds: Leds {},
             led_pwr: LedPwr {},
+            touch: Touch {},
             // Order: USART3, USART1, USART4, USART2
             usarts_tx: [
                 UsartTx {
@@ -1264,6 +1293,35 @@ fn SPI1() {
 }
 
 pub struct LedPwr {}
+
+pub struct Touch {}
+
+impl Touch {
+    /// Read touch key value from PA1 (ADC2_IN1)
+    ///
+    /// Returns the ADC value representing the capacitance.
+    /// Lower values typically indicate a touch event.
+    pub async fn read(&mut self) -> u16 {
+        let tkey2 = unsafe { pac::adc::Tkey::from_ptr(pac::ADC2.as_ptr()) };
+
+        // Start TKEY sample by writing discharge time to act_dcg register
+        // This triggers both discharge and conversion
+        tkey2.act_dcg().write_value(4);
+
+        // Wait for conversion to complete
+        while !pac::ADC2.statr().read().eoc() {
+            embassy_futures::yield_now().await;
+        }
+
+        // Read the result from TKEY data register
+        let result = tkey2.dr().read();
+
+        // Clear EOC flag
+        pac::ADC2.statr().modify(|w| w.set_eoc(false));
+
+        result
+    }
+}
 
 impl LedPwr {
     pub fn set_pwr(&mut self, on: bool) {

@@ -40,7 +40,7 @@ async fn rx_task(
                     })
                 {
                     let now = Instant::now();
-                    println!("RX: {:?}", received_comm_state);
+                    //println!("RX: {:?}", received_comm_state);
                     // We got a valid packet--update the state
 
                     let mut trickle_state = trickle_state
@@ -108,7 +108,7 @@ async fn tx_task(
                     .try_lock()
                     .expect("comm_state lock cannot be held across an .await");
                 comm_state.update(now);
-                println!("TX: {:?}", &comm_state);
+                //println!("TX: {:?}", &comm_state);
                 let mut tx_buffer = vec![0u8; MAX_PACKET_LEN + 1];
                 // We retain an initial '\0' to improve packet start detection
                 let len = comm_state.serialize_packet(&mut tx_buffer[1..]).len() + 1;
@@ -129,7 +129,7 @@ async fn tx_task(
 
 const HIGH_PRIORITY_SEQ_INCREMENT: u64 = 8;
 const LONG_TIMEOUT: Duration = Duration::from_millis(1_000);
-const INITIAL_CODE_CHUNK_TIMEOUT: Duration = Duration::from_millis(100);
+const INITIAL_CODE_CHUNK_TIMEOUT: Duration = Duration::from_millis(180);
 const HARDWARE_ID: u32 = 1;
 const CHUNK_SIZE: usize = 256;
 
