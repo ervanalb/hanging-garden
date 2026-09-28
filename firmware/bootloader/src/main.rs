@@ -65,7 +65,7 @@ async unsafe fn validate_and_branch_to_app(
     // Check magic number
     if config.magic != BOOTLOADER_CONFIG_MAGIC {
         defmt::warn!("Invalid magic number in config: 0x{:08X}", config.magic);
-        *bl_state = BlState::InvalidApp;
+        *bl_state = BlState::IndicateBad;
         return;
     }
 
@@ -77,7 +77,7 @@ async unsafe fn validate_and_branch_to_app(
             "Invalid firmware size: {} bytes",
             config.firmware_size_bytes
         );
-        *bl_state = BlState::InvalidApp;
+        *bl_state = BlState::IndicateBad;
         return;
     }
 
@@ -121,7 +121,7 @@ async unsafe fn validate_and_branch_to_app(
             calculated_crc,
             config.firmware_crc32
         );
-        *bl_state = BlState::InvalidApp;
+        *bl_state = BlState::IndicateBad;
     }
 }
 
@@ -144,7 +144,8 @@ enum BlState {
         firmware_crc32: u32,
         stalled: bool,
     },
-    InvalidApp,
+    IndicateGood,
+    IndicateBad,
 }
 
 #[embassy_executor::task]
@@ -261,8 +262,16 @@ async fn led_task(
                         led_pattern[i * 3 + 2] = bg_color[2];
                     }
                 }
-                BlState::InvalidApp => {
-                    // Invalid app state, display all dark red
+                BlState::IndicateGood => {
+                    // Display green
+                    for i in 0..10 {
+                        led_pattern[i * 3] = 0x10; // G
+                        led_pattern[i * 3 + 1] = 0x00; // R
+                        led_pattern[i * 3 + 2] = 0x00; // B
+                    }
+                }
+                BlState::IndicateBad => {
+                    // Display red
                     for i in 0..10 {
                         led_pattern[i * 3] = 0x00; // G
                         led_pattern[i * 3 + 1] = 0x10; // R
@@ -513,6 +522,9 @@ async fn rx_task(
                                         };
                                         bl_code_progress.chunk_count =
                                             bl_code_progress.chunk_count.min(chunk_index);
+                                    }
+                                    CommType::BlIndicateGood => {
+                                        *bl_state = BlState::IndicateGood;
                                     }
                                     CommType::BlUnknown => {}
                                 }

@@ -100,6 +100,7 @@ pub const COMM_TYPE_BL_INIT: u8 = 0xF0;
 pub const COMM_TYPE_BL_BROADCAST_PING: u8 = 0xF1;
 pub const COMM_TYPE_BL_CODE_WRITE: u8 = 0xF2;
 pub const COMM_TYPE_BL_CODE_PROGRESS: u8 = 0xF3;
+pub const COMM_TYPE_BL_INDICATE_GOOD: u8 = 0xF4;
 pub const COMM_TYPE_BL_UNKNOWN: u8 = 0xFF;
 
 #[cfg(test)]
@@ -123,6 +124,8 @@ pub enum CommType {
     BlCodeWrite(BlCodeWrite) = COMM_TYPE_BL_CODE_WRITE,
     #[cfg(feature = "bl")]
     BlCodeProgress(BlCodeProgress) = COMM_TYPE_BL_CODE_PROGRESS,
+    #[cfg(feature = "bl")]
+    BlIndicateGood = COMM_TYPE_BL_INDICATE_GOOD,
     BlUnknown = COMM_TYPE_BL_UNKNOWN,
     #[cfg(test)]
     TestAppUnknown(u32) = COMM_TYPE_TEST_APP_UNKNOWN,
@@ -180,6 +183,13 @@ impl Serialize for CommType {
                 "BlCodeProgress",
                 data,
             ),
+            #[cfg(feature = "bl")]
+            CommType::BlIndicateGood => Serializer::serialize_unit_variant(
+                serializer,
+                "CommType",
+                COMM_TYPE_BL_INDICATE_GOOD as u32,
+                "BlIndicateGood",
+            ),
             CommType::BlUnknown => Serializer::serialize_unit_variant(
                 serializer,
                 "CommType",
@@ -211,75 +221,6 @@ impl<'de> Deserialize<'de> for CommType {
     where
         D: Deserializer<'de>,
     {
-        /*
-        struct FieldVisitor;
-        impl<'de> de::Visitor<'de> for FieldVisitor {
-            type Value = u8;
-            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
-                core::fmt::Formatter::write_str(formatter, "variant identifier")
-            }
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(value as u8)
-            }
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                match value {
-                    #[cfg(feature = "app")]
-                    "Init" => Ok(COMM_TYPE_INIT),
-                    "Unknown" => Ok(COMM_TYPE_UNKNOWN),
-                    #[cfg(feature = "bl")]
-                    "BlInit" => Ok(COMM_TYPE_BL_INIT),
-                    #[cfg(feature = "bl")]
-                    "BlBroadcastPing" => Ok(COMM_TYPE_BL_BROADCAST_PING),
-                    #[cfg(feature = "bl")]
-                    "BlCodeWrite" => Ok(COMM_TYPE_BL_CODE_WRITE),
-                    #[cfg(feature = "bl")]
-                    "BlCodeProgress" => Ok(COMM_TYPE_BL_CODE_PROGRESS),
-                    "BlUnknown" => Ok(COMM_TYPE_BL_UNKNOWN),
-                    _ => Err(de::Error::unknown_variant(value, VARIANTS)),
-                }
-            }
-            fn visit_bytes<__E>(self, __value: &[u8]) -> Result<Self::Value, __E>
-            where
-                __E: de::Error,
-            {
-                match __value {
-                    #[cfg(feature = "app")]
-                    b"Init" => Ok(COMM_TYPE_INIT),
-                    b"Unknown" => Ok(COMM_TYPE_UNKNOWN),
-                    #[cfg(feature = "bl")]
-                    b"BlInit" => Ok(COMM_TYPE_BL_INIT),
-                    #[cfg(feature = "bl")]
-                    b"BlBroadcastPing" => Ok(COMM_TYPE_BL_BROADCAST_PING),
-                    #[cfg(feature = "bl")]
-                    b"BlCodeWrite" => Ok(COMM_TYPE_BL_CODE_WRITE),
-                    #[cfg(feature = "bl")]
-                    b"BlCodeProgress" => Ok(COMM_TYPE_BL_CODE_PROGRESS),
-                    b"BlUnknown" => Ok(COMM_TYPE_BL_UNKNOWN),
-                    _ => {
-                        let __value = &String::from_utf8_lossy(__value);
-                        Err(de::Error::unknown_variant(__value, VARIANTS))
-                    }
-                }
-            }
-        }
-        //#[automatically_derived]
-        //impl<'de> Deserialize<'de> for __Field {
-        //    #[inline]
-        //    fn deserialize<__D>(__deserializer: __D) -> Result<Self, __D::Error>
-        //    where
-        //        __D: Deserializer<'de>,
-        //    {
-        //        Deserializer::deserialize_identifier(__deserializer, __FieldVisitor)
-        //    }
-        //}
-        */
-
         struct Visitor<'de> {
             marker: PhantomData<CommType>,
             lifetime: PhantomData<&'de ()>,
@@ -320,6 +261,11 @@ impl<'de> Deserialize<'de> for CommType {
                         de::VariantAccess::newtype_variant::<BlCodeProgress>(variant),
                         CommType::BlCodeProgress,
                     ),
+                    #[cfg(feature = "bl")]
+                    Ok((COMM_TYPE_BL_INDICATE_GOOD, variant)) => {
+                        de::VariantAccess::unit_variant(variant)?;
+                        Ok(CommType::BlIndicateGood)
+                    }
                     Ok((d, variant)) if (d & COMM_TYPE_BL_BITMASK) == 0 => {
                         de::VariantAccess::unit_variant(variant)?;
                         Ok(CommType::Unknown)
@@ -409,6 +355,8 @@ impl CommType {
             CommType::BlCodeProgress(data) => {
                 array::from_fn(|_| Self::BlCodeProgress(data.clone()))
             }
+            #[cfg(feature = "bl")]
+            CommType::BlIndicateGood => array::from_fn(|_| Self::BlIndicateGood),
             CommType::BlUnknown => array::from_fn(|_| Self::BlUnknown),
             #[cfg(test)]
             CommType::TestAppUnknown(data) => array::from_fn(|_| Self::TestAppUnknown(*data)),
@@ -430,6 +378,8 @@ impl CommType {
             (CommType::BlCodeWrite(s), CommType::BlCodeWrite(o)) => s.consider(o),
             #[cfg(feature = "bl")]
             (CommType::BlCodeProgress(s), CommType::BlCodeProgress(o)) => s.consider(o),
+            #[cfg(feature = "bl")]
+            (CommType::BlIndicateGood, CommType::BlIndicateGood) => TrickleOrdering::Consistent,
             (CommType::BlUnknown, CommType::BlUnknown) => TrickleOrdering::Consistent,
             #[cfg(test)]
             (CommType::TestAppUnknown(_), CommType::TestAppUnknown(_)) => {
@@ -452,133 +402,6 @@ impl CommType {
         }
     }
 }
-
-/*
-impl Serialize for CommType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeTuple;
-
-        match self {
-            #[cfg(feature = "app")]
-            CommType::Init => serializer.serialize_u8(COMM_TYPE_INIT),
-            CommType::Unknown => serializer.serialize_u8(COMM_TYPE_UNKNOWN),
-            #[cfg(feature = "bl")]
-            CommType::BlInit => serializer.serialize_u8(COMM_TYPE_BL_INIT),
-            #[cfg(feature = "bl")]
-            CommType::BlBroadcastPing(data) => {
-                let mut tuple = serializer.serialize_tuple(2)?;
-                tuple.serialize_element(&COMM_TYPE_BL_BROADCAST_PING)?;
-                tuple.serialize_element(data)?;
-                tuple.end()
-            }
-            #[cfg(feature = "bl")]
-            CommType::BlCodeWrite(data) => {
-                let mut tuple = serializer.serialize_tuple(2)?;
-                tuple.serialize_element(&COMM_TYPE_BL_CODE_WRITE)?;
-                tuple.serialize_element(data)?;
-                tuple.end()
-            }
-            #[cfg(feature = "bl")]
-            CommType::BlCodeProgress(data) => {
-                let mut tuple = serializer.serialize_tuple(2)?;
-                tuple.serialize_element(&COMM_TYPE_BL_CODE_PROGRESS)?;
-                tuple.serialize_element(data)?;
-                tuple.end()
-            }
-            CommType::BlUnknown => serializer.serialize_u8(COMM_TYPE_BL_UNKNOWN),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CommType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::SeqAccess;
-
-        struct CommTypeVisitor;
-
-        impl<'de> Visitor<'de> for CommTypeVisitor {
-            type Value = CommType;
-
-            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
-                formatter.write_str("a CommType discriminant and optional data")
-            }
-
-            fn visit_u8<E>(self, discriminant: u8) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                // Unit variants that are just a discriminant byte
-                match discriminant {
-                    #[cfg(feature = "app")]
-                    COMM_TYPE_INIT => Ok(CommType::Init),
-                    COMM_TYPE_UNKNOWN => Ok(CommType::Unknown),
-                    #[cfg(feature = "bl")]
-                    COMM_TYPE_BL_INIT => Ok(CommType::BlInit),
-                    COMM_TYPE_BL_UNKNOWN => Ok(CommType::BlUnknown),
-                    _ => {
-                        // Unknown variant - return appropriate Unknown variant based on high bits
-                        if (discriminant & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK {
-                            Ok(CommType::BlUnknown)
-                        } else {
-                            Ok(CommType::Unknown)
-                        }
-                    }
-                }
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                // Tuple variants: (discriminant, data)
-                let discriminant: u8 = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-
-                match discriminant {
-                    #[cfg(feature = "app")]
-                    COMM_TYPE_INIT => Ok(CommType::Init),
-                    COMM_TYPE_UNKNOWN => Ok(CommType::Unknown),
-                    #[cfg(feature = "bl")]
-                    COMM_TYPE_BL_INIT => Ok(CommType::BlInit),
-                    #[cfg(feature = "bl")]
-                    COMM_TYPE_BL_CODE_WRITE => {
-                        let data: BlCodeWrite = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                        Ok(CommType::BlCodeWrite(data))
-                    }
-                    #[cfg(feature = "bl")]
-                    COMM_TYPE_BL_CODE_PROGRESS => {
-                        let data: BlCodeProgress = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                        Ok(CommType::BlCodeProgress(data))
-                    }
-                    COMM_TYPE_BL_UNKNOWN => Ok(CommType::BlUnknown),
-                    _ => {
-                        // Unknown variant - consume any remaining data and return appropriate Unknown variant
-                        let _ = seq.next_element::<de::IgnoredAny>();
-                        if (discriminant & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK {
-                            Ok(CommType::BlUnknown)
-                        } else {
-                            Ok(CommType::Unknown)
-                        }
-                    }
-                }
-            }
-        }
-
-        deserializer.deserialize_any(CommTypeVisitor)
-    }
-}
-*/
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AgeMicros {
