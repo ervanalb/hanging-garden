@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+use core::cmp::Ordering;
 #[cfg(feature = "std")]
 #[allow(unused)]
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use core::marker::PhantomData;
 
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use trickle::{TrickleOrd, TrickleOrdering, TrickleParams};
+use trickle::TrickleParams;
 
 static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
 
@@ -25,22 +26,57 @@ pub const TRICKLE_PARAMS: TrickleParams = TrickleParams {
 
 pub const MAX_PACKET_LEN: usize = 300;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+pub struct MergeResult {
+    pub older: bool,
+    pub newer: bool,
+}
+
+impl MergeResult {
+    pub const CONSISTENT: MergeResult = MergeResult {
+        older: false,
+        newer: false,
+    };
+    pub const NEWER: MergeResult = MergeResult {
+        older: false,
+        newer: true,
+    };
+    pub const OLDER: MergeResult = MergeResult {
+        older: false,
+        newer: true,
+    };
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, defmt::Format)]
 pub struct CommState {
     pub seq_num: u64,
     pub type_: CommType,
 }
 
+/*
 impl TrickleOrd for CommState {
     fn consider(&self, other: &Self) -> trickle::TrickleOrdering {
         let consider_seq_num = TrickleOrdering::from(other.seq_num.cmp(&self.seq_num));
         consider_seq_num.then_with(|| self.type_.consider(&other.type_))
     }
 }
+*/
 
 impl CommState {
     pub fn update(&mut self, now: Instant) {
         self.type_.update(now);
+    }
+
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        if other.seq_num > self.seq_num {
+            *self = other.clone();
+            return MergeResult::NEWER;
+        }
+        if other.seq_num < self.seq_num {
+            return MergeResult::OLDER;
+        }
+        // seq_num is equal
+        return self.type_.merge(&other.type_);
     }
 
     pub fn propagate(&self) -> [Self; 4] {
@@ -104,7 +140,7 @@ pub const COMM_TYPE_BL_INDICATE_GOOD: u8 = 0xF4;
 pub const COMM_TYPE_BL_UNKNOWN: u8 = 0xFF;
 
 #[cfg(test)]
-pub const COMM_TYPE_TEST_APP_UNKNOWN: u8 = 0x7E;
+pub const COMM_TYPE_TEST_APP_UNKNOWN: u8 = 0xEE;
 #[cfg(test)]
 pub const COMM_TYPE_TEST_BL_UNKNOWN: u8 = 0xFE;
 
@@ -266,13 +302,13 @@ impl<'de> Deserialize<'de> for CommType {
                         de::VariantAccess::unit_variant(variant)?;
                         Ok(CommType::BlIndicateGood)
                     }
-                    Ok((d, variant)) if (d & COMM_TYPE_BL_BITMASK) == 0 => {
+                    Ok((d, variant)) if (d & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK => {
                         de::VariantAccess::unit_variant(variant)?;
-                        Ok(CommType::Unknown)
+                        Ok(CommType::BlUnknown)
                     }
                     Ok((_, variant)) => {
                         de::VariantAccess::unit_variant(variant)?;
-                        Ok(CommType::BlUnknown)
+                        Ok(CommType::Unknown)
                     }
                     Err(err) => Err(err),
                 }
@@ -325,7 +361,7 @@ impl CommType {
     }
 
     pub fn is_bl(&self) -> bool {
-        (self.discriminant() & COMM_TYPE_BL_BITMASK) != 0
+        (self.discriminant() & COMM_TYPE_BL_BITMASK) == COMM_TYPE_BL_BITMASK
     }
 
     pub fn update(&mut self, now: Instant) {
@@ -365,6 +401,56 @@ impl CommType {
         }
     }
 
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        match (&mut *self, other) {
+            #[cfg(feature = "app")]
+            (CommType::Init, CommType::Init) => MergeResult::CONSISTENT,
+            (CommType::Unknown, CommType::Unknown) => MergeResult::CONSISTENT,
+            #[cfg(feature = "bl")]
+            (CommType::BlInit, CommType::BlInit) => MergeResult::CONSISTENT,
+            #[cfg(feature = "bl")]
+            (CommType::BlBroadcastPing(s), CommType::BlBroadcastPing(o)) => s.merge(o),
+            #[cfg(feature = "bl")]
+            (CommType::BlCodeWrite(s), CommType::BlCodeWrite(o)) => s.merge(o),
+            #[cfg(feature = "bl")]
+            (CommType::BlCodeProgress(s), CommType::BlCodeProgress(o)) => s.merge(o),
+            #[cfg(feature = "bl")]
+            (CommType::BlIndicateGood, CommType::BlIndicateGood) => MergeResult::CONSISTENT,
+            (CommType::BlUnknown, CommType::BlUnknown) => MergeResult::CONSISTENT,
+            #[cfg(test)]
+            (CommType::TestAppUnknown(_), CommType::TestAppUnknown(_)) => MergeResult::CONSISTENT,
+            #[cfg(test)]
+            (CommType::TestBlUnknown(_), CommType::TestBlUnknown(_)) => MergeResult::CONSISTENT,
+            (s, CommType::Unknown) if !s.is_bl() => MergeResult::CONSISTENT,
+            (CommType::Unknown, o) if !o.is_bl() => {
+                *self = o.clone();
+                MergeResult::NEWER
+            }
+            (s, CommType::BlUnknown) if s.is_bl() => MergeResult::CONSISTENT,
+            (CommType::BlUnknown, o) if o.is_bl() => {
+                *self = o.clone();
+                MergeResult::NEWER
+            }
+            (s, o) => {
+                // First compare by domain: app types (false) are Greater than BL types (true)
+                match s
+                    .is_bl()
+                    .cmp(&o.is_bl())
+                    // Then within same domain: higher discriminant is Greater
+                    .then(o.discriminant().cmp(&s.discriminant()))
+                {
+                    Ordering::Greater => {
+                        *self = other.clone();
+                        MergeResult::NEWER
+                    }
+                    Ordering::Equal => MergeResult::CONSISTENT,
+                    Ordering::Less => MergeResult::OLDER,
+                }
+            }
+        }
+    }
+
+    /*
     pub fn consider(&self, other: &Self) -> TrickleOrdering {
         match (self, other) {
             #[cfg(feature = "app")]
@@ -401,6 +487,7 @@ impl CommType {
             }
         }
     }
+    */
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -441,20 +528,26 @@ pub struct BlBroadcastPing {
     pub data: heapless::Vec<u8, 256>,
 }
 
-#[cfg(feature = "bl")]
 impl BlBroadcastPing {
     pub fn update(&mut self, now: Instant) {
         self.age_micros.update(now);
     }
 
-    pub fn consider(&self, other: &Self) -> TrickleOrdering {
-        TrickleOrdering::from(other.latency_micros.cmp(&self.latency_micros))
-        // age_micros is ignored--always compares equal
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        // All fields except latency_micros are ignored
+        match other.latency_micros.cmp(&self.latency_micros) {
+            Ordering::Greater => {
+                *self = other.clone();
+                MergeResult::NEWER
+            }
+            Ordering::Equal => MergeResult::CONSISTENT,
+            Ordering::Less => MergeResult::OLDER,
+        }
     }
 }
 
 #[cfg(feature = "bl")]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, defmt::Format)]
+#[derive(Serialize, Deserialize, Debug, Clone, defmt::Format)]
 pub struct BlCodeWrite {
     pub hardware_id: u32,
     pub firmware_size_bytes: u32,
@@ -465,8 +558,22 @@ pub struct BlCodeWrite {
 
 #[cfg(feature = "bl")]
 impl BlCodeWrite {
-    pub fn consider(&self, other: &Self) -> TrickleOrdering {
-        other.cmp(self).into()
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        match other.hardware_id.cmp(&self.hardware_id).then(
+            other
+                .firmware_size_bytes
+                .cmp(&self.firmware_size_bytes)
+                .then(other.firmware_crc32.cmp(&self.firmware_crc32))
+                .then(other.chunk_index.cmp(&self.chunk_index))
+                .then_with(|| other.chunk_data.cmp(&self.chunk_data)),
+        ) {
+            Ordering::Greater => {
+                *self = other.clone();
+                MergeResult::NEWER
+            }
+            Ordering::Equal => MergeResult::CONSISTENT,
+            Ordering::Less => MergeResult::OLDER,
+        }
     }
 }
 
@@ -479,13 +586,20 @@ pub struct BlCodeProgress {
 
 #[cfg(feature = "bl")]
 impl BlCodeProgress {
-    pub fn consider(&self, other: &Self) -> TrickleOrdering {
-        let consider_hwid = TrickleOrdering::from(other.hardware_id.cmp(&self.hardware_id));
-        // Lower chunk counts compare as "greater" so the network will reach a consensus
-        // corresponding to the device with the least complete firmware update
-        let consider_chunk_count =
-            TrickleOrdering::from(other.chunk_count.cmp(&self.chunk_count).reverse());
-        consider_hwid.then(consider_chunk_count)
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        // Reverse chunk_count comparison so that lower progress wins
+        match other
+            .hardware_id
+            .cmp(&self.hardware_id)
+            .then(other.chunk_count.cmp(&self.chunk_count).reverse())
+        {
+            Ordering::Greater => {
+                *self = other.clone();
+                MergeResult::NEWER
+            }
+            Ordering::Equal => MergeResult::CONSISTENT,
+            Ordering::Less => MergeResult::OLDER,
+        }
     }
 }
 
@@ -641,7 +755,6 @@ mod tests {
 
         let mut buffer = [0u8; MAX_PACKET_LEN];
         let serialized = state.serialize_packet(&mut buffer);
-        dbg!(&serialized);
         let deserialized =
             CommState::try_deserialize_packet(serialized).expect("Failed to deserialize packet");
 
@@ -725,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consider_unknown_states() {
+    fn test_compare_unknown_states() {
         // Test app-side states with Unknown
         #[cfg(feature = "app")]
         {
@@ -738,17 +851,11 @@ mod tests {
                 type_: CommType::Unknown,
             };
 
-            // Init.consider(Unknown) should produce Consistent
-            assert!(matches!(
-                init_state.consider(&unknown_state),
-                TrickleOrdering::Consistent
-            ));
-
-            // Unknown.consider(Init) should produce Greater
-            assert!(matches!(
-                unknown_state.consider(&init_state),
-                TrickleOrdering::Greater
-            ));
+            assert_eq!(
+                init_state.clone().merge(&unknown_state),
+                MergeResult::CONSISTENT
+            );
+            assert_eq!(unknown_state.clone().merge(&init_state), MergeResult::NEWER);
         }
 
         // Test bootloader-side states with BlUnknown
@@ -763,17 +870,14 @@ mod tests {
                 type_: CommType::BlUnknown,
             };
 
-            // BlInit.consider(BlUnknown) should produce Consistent
-            assert!(matches!(
-                bl_init_state.consider(&bl_unknown_state),
-                TrickleOrdering::Consistent
-            ));
-
-            // BlUnknown.consider(BlInit) should produce Greater
-            assert!(matches!(
-                bl_unknown_state.consider(&bl_init_state),
-                TrickleOrdering::Greater
-            ));
+            assert_eq!(
+                bl_init_state.clone().merge(&bl_unknown_state),
+                MergeResult::CONSISTENT
+            );
+            assert_eq!(
+                bl_unknown_state.clone().merge(&bl_init_state),
+                MergeResult::NEWER
+            );
 
             let bl_ping_state = CommState {
                 seq_num: 200,
@@ -787,17 +891,14 @@ mod tests {
                 }),
             };
 
-            // BlBroadcastPing.consider(BlUnknown) should produce Consistent
-            assert!(matches!(
-                bl_ping_state.consider(&bl_unknown_state),
-                TrickleOrdering::Consistent
-            ));
-
-            // BlUnknown.consider(BlBroadcastPing) should produce Greater
-            assert!(matches!(
-                bl_unknown_state.consider(&bl_ping_state),
-                TrickleOrdering::Greater
-            ));
+            assert_eq!(
+                bl_ping_state.clone().merge(&bl_unknown_state),
+                MergeResult::CONSISTENT
+            );
+            assert_eq!(
+                bl_unknown_state.clone().merge(&bl_ping_state),
+                MergeResult::NEWER
+            );
         }
 
         // Test that Unknown and BlUnknown don't cross domains
@@ -810,17 +911,8 @@ mod tests {
             type_: CommType::BlUnknown,
         };
 
-        // Unknown.consider(BlUnknown) should NOT produce Consistent (different domains)
-        assert!(!matches!(
-            unknown_state.consider(&bl_unknown_state),
-            TrickleOrdering::Consistent
-        ));
-
-        // BlUnknown.consider(Unknown) should NOT produce Consistent (different domains)
-        assert!(!matches!(
-            bl_unknown_state.consider(&unknown_state),
-            TrickleOrdering::Consistent
-        ));
+        assert!(unknown_state.clone().merge(&bl_unknown_state) != MergeResult::CONSISTENT);
+        assert!(bl_unknown_state.clone().merge(&unknown_state) != MergeResult::CONSISTENT);
     }
 
     #[test]
@@ -835,14 +927,14 @@ mod tests {
             type_: CommType::Unknown,
         };
 
-        assert!(matches!(
-            unknown_state1.consider(&unknown_state2),
-            TrickleOrdering::Consistent
-        ));
-        assert!(matches!(
-            unknown_state2.consider(&unknown_state1),
-            TrickleOrdering::Consistent
-        ));
+        assert_eq!(
+            unknown_state1.clone().merge(&unknown_state2),
+            MergeResult::CONSISTENT
+        );
+        assert_eq!(
+            unknown_state2.clone().merge(&unknown_state1),
+            MergeResult::CONSISTENT
+        );
 
         // Test that BlUnknown is consistent with itself
         let bl_unknown_state1 = CommState {
@@ -854,14 +946,14 @@ mod tests {
             type_: CommType::BlUnknown,
         };
 
-        assert!(matches!(
-            bl_unknown_state1.consider(&bl_unknown_state2),
-            TrickleOrdering::Consistent
-        ));
-        assert!(matches!(
-            bl_unknown_state2.consider(&bl_unknown_state1),
-            TrickleOrdering::Consistent
-        ));
+        assert_eq!(
+            bl_unknown_state1.clone().merge(&bl_unknown_state2),
+            MergeResult::CONSISTENT
+        );
+        assert_eq!(
+            bl_unknown_state2.clone().merge(&bl_unknown_state1),
+            MergeResult::CONSISTENT
+        );
     }
 
     #[test]
@@ -877,18 +969,12 @@ mod tests {
             type_: CommType::BlInit,
         };
 
-        // App.consider(BL) should produce Less
-        assert!(matches!(
-            app_state.consider(&bl_state),
-            TrickleOrdering::Less
-        ));
+        // App.merge(BL) should produce OLDER (app is older than BL)
+        assert_eq!(app_state.clone().merge(&bl_state), MergeResult::OLDER);
 
-        // BL.consider(App) should produce Greater
+        // BL.merge(App) should produce NEWER
         // (since App runs after the bootloader
         // and both may have a seq_num of 0)
-        assert!(matches!(
-            bl_state.consider(&app_state),
-            TrickleOrdering::Greater
-        ));
+        assert_eq!(bl_state.clone().merge(&app_state), MergeResult::NEWER);
     }
 }

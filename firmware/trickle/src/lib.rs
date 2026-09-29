@@ -13,8 +13,6 @@ use embassy_time::Duration;
 #[cfg(feature = "impl-embassy")]
 use embassy_time::Instant;
 
-use core::cmp::Ordering;
-
 #[derive(Debug)]
 pub struct TrickleParams {
     pub i_min_micros: u64,
@@ -112,27 +110,21 @@ impl<'a> TrickleState<'a> {
         }
     }
 
-    /// Takes appropriate trickle actions given that we are assuming newer state.
-    /// The polling loop should be woken.
-    pub fn got_new_state(&mut self, now: Instant) {
-        self.reset_interval();
-        self.begin_interval(now);
-    }
-
-    /// Takes appropriate trickle actions given that we received a consistent (redundant) state.
+    /// Takes appropriate trickle actions given that we received a consistent state.
     /// (The polling loop does not need to be woken.)
     pub fn got_consistent_state(&mut self) {
         self.counter += 1;
     }
 
-    /// Takes appropriate trickle actions given that we received an outdated state.
+    /// Takes appropriate trickle actions given that we received an inconsistent state.
     /// The polling loop should be woken.
-    pub fn got_outdated_state(&mut self, now: Instant) {
+    pub fn got_inconsistent_state(&mut self, now: Instant) {
         self.reset_interval();
         self.begin_interval(now);
     }
 }
 
+/*
 pub trait TrickleOrd {
     /// Note that comparison cannot necessarily be reversed.
     /// a.consider(b).reverse() is generally NOT the same as b.consider(a).
@@ -192,3 +184,4 @@ impl From<Ordering> for TrickleOrdering {
         }
     }
 }
+*/

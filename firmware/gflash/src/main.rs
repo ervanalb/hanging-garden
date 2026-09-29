@@ -1,6 +1,6 @@
 use log::{debug, error, info, trace};
 use proto::{
-    BlBroadcastPing, BlCodeProgress, BlCodeWrite, CommState, CommType, MAX_PACKET_LEN,
+    BlBroadcastPing, BlCodeProgress, BlCodeWrite, CommState, CommType, MAX_PACKET_LEN, MergeResult,
     TRICKLE_PARAMS,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tokio_serial::SerialPortBuilderExt;
-use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
+use trickle::{TricklePollResult, TrickleState};
 
 async fn rx_task(
     serial_rx: tokio::io::ReadHalf<tokio_serial::SerialStream>,
@@ -44,37 +44,24 @@ async fn rx_task(
                     debug!("RX: {:?}", received_comm_state);
                     // We got a valid packet--update the state
 
-                    let mut trickle_state = trickle_state
-                        .try_lock()
-                        .expect("trickle lock should not be held across .awaits");
+                    let result = {
+                        let mut comm_state = comm_state.lock().await;
+                        comm_state.merge(&received_comm_state)
+                    };
 
-                    let mut comm_state = comm_state
-                        .try_lock()
-                        .expect("comm_state lock should not be held across .awaits");
-                    match comm_state.consider(&received_comm_state) {
-                        TrickleOrdering::Greater => {
-                            // Receiving a newer state means that we should assume it.
-                            new_comm_state(
-                                received_comm_state.clone(),
-                                &mut *comm_state,
-                                &mut *trickle_state,
-                                trickle_notify,
-                                new_comm_notify,
-                                now,
-                            );
-                        }
-                        TrickleOrdering::Consistent => {
+                    {
+                        let mut trickle_state = trickle_state.lock().await;
+                        if result == MergeResult::CONSISTENT {
                             trickle_state.got_consistent_state();
-                            // No need to wake
-                        }
-                        TrickleOrdering::Less => {
-                            trickle_state.got_outdated_state(now);
+                        } else {
+                            trickle_state.got_inconsistent_state(now);
                             let _ = trickle_notify.send(());
                         }
                     }
 
-                    // Wake the event loop
-                    let _ = trickle_notify.send(());
+                    if result.newer {
+                        let _ = new_comm_notify.send(());
+                    }
                 }
             }
             Err(e) => {
@@ -95,7 +82,7 @@ fn new_comm_state(
 ) {
     *comm_state = new_comm_state;
     comm_state.update(now);
-    trickle_state.got_new_state(now);
+    trickle_state.got_inconsistent_state(now);
     let _ = trickle_notify.send(());
     let _ = new_comm_notify.send(());
 }
@@ -109,13 +96,13 @@ async fn tx_task(
     loop {
         let now = Instant::now();
 
-        let mut trickle_state = trickle_state
-            .try_lock()
-            .expect("trickle lock cannot be held across an .await");
-        match trickle_state.poll(now) {
+        let trickle_poll = {
+            let mut trickle_state = trickle_state.lock().await;
+            trickle_state.poll(now)
+        };
+        match trickle_poll {
             TricklePollResult::Wait(timeout_micros) => {
                 // Drop the lock before waiting
-                drop(trickle_state);
 
                 // Wait for the allotted time, or until we are interrupted from rx_task
                 tokio::select! {
@@ -124,21 +111,19 @@ async fn tx_task(
                 }
             }
             TricklePollResult::Send => {
-                let mut comm_state = comm_state
-                    .try_lock()
-                    .expect("comm_state lock cannot be held across an .await");
-                comm_state.update(now);
-                debug!("TX: {:?}", &comm_state);
-                let mut tx_buffer = vec![0u8; MAX_PACKET_LEN + 1];
-                // We retain an initial '\0' to improve packet start detection
-                let len = comm_state.serialize_packet(&mut tx_buffer[1..]).len() + 1;
-                trace!("TX bytes: {:?}", &tx_buffer[..len]);
+                let tx_buffer = {
+                    let mut comm_state = comm_state.lock().await;
+                    comm_state.update(now);
+                    debug!("TX: {:?}", &comm_state);
+                    let mut tx_buffer = vec![0u8; MAX_PACKET_LEN + 1];
+                    // We retain an initial '\0' to improve packet start detection
+                    let len = comm_state.serialize_packet(&mut tx_buffer[1..]).len() + 1;
+                    tx_buffer.truncate(len);
+                    tx_buffer
+                };
+                trace!("TX bytes: {:?}", &tx_buffer);
 
-                // Drop the locks before writing
-                drop(comm_state);
-                drop(trickle_state);
-
-                if let Err(e) = serial_tx.write_all(&tx_buffer[..len]).await {
+                if let Err(e) = serial_tx.write_all(&tx_buffer).await {
                     error!("TX error: {}", e);
                     return;
                 }
@@ -251,12 +236,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if comm_state.seq_num > seq_num {
                     // Update with higher seq_num:
                     // One-up the message with an even higher seq_num
+                    seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
                     let mut trickle_state = trickle_state
                         .try_lock()
                         .expect("trickle_state lock cannot be held across an .await");
                     new_comm_state(
                         CommState {
-                            seq_num: comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT,
+                            seq_num,
                             type_: CommType::BlInit,
                         },
                         &mut *comm_state,

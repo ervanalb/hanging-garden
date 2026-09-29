@@ -527,6 +527,10 @@ async fn rx_task(
                                         *bl_state = BlState::IndicateGood;
                                     }
                                     CommType::BlUnknown => {}
+                                    #[cfg(test)]
+                                    CommType::TestAppUnknown(_) => unreachable!(),
+                                    #[cfg(test)]
+                                    CommType::TestBlUnknown(_) => unreachable!(),
                                 }
                                 {
                                     let mut did_receive_packet =
