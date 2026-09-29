@@ -10,3 +10,5 @@ proto = { path = "../proto" }
 trickle = { path = "../trickle", features = ["impl-std"] }
 heapless = "0.9"
 crc = "3.2"
+log = "0.4"
+env_logger = "0.11"
