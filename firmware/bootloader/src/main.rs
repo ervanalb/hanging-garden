@@ -31,15 +31,14 @@ unsafe extern "C" {
     static _eapp_usr: ();
 }
 
-use embassy_futures::join::join_array;
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Flash, HARDWARE_ID, Hardware, UsartRx, UsartTx, Watchdog};
-use proto::{CommState, CommType, MAX_PACKET_LEN, TRICKLE_PARAMS};
+use hal::{Direction, Flash, HARDWARE_ID, Hardware, UsartRx, UsartTx, Watchdog};
+use proto::{CommState, CommType, MAX_PACKET_LEN, MergeResult, TRICKLE_PARAMS};
 use static_cell::StaticCell;
-use trickle::{TrickleOrd, TrickleOrdering, TricklePollResult, TrickleState};
+use trickle::{TricklePollResult, TrickleState};
 
 static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
 
@@ -52,11 +51,7 @@ const BOOTLOADER_CONFIG_MAGIC: u32 = 0x7ac37303;
 /// # Safety
 /// This function may branch to application code.
 /// It should only be called when not in an interrupt.
-async unsafe fn validate_and_branch_to_app(
-    bl_state: &mut BlState,
-    flash: &Mutex<NoopRawMutex, Flash>,
-) {
-    let _flash_guard = flash.lock().await;
+unsafe fn validate_and_branch_to_app(bl_state: &mut BlState, _flash: &mut Flash) {
     // Read the config from flash
     // Safety: BOOTLOADER_CONFIG is at a fixed, valid memory location
     let config_ptr = &BOOTLOADER_CONFIG as *const BootloaderConfig;
@@ -125,14 +120,25 @@ async unsafe fn validate_and_branch_to_app(
     }
 }
 
-static STATE: StaticCell<(
-    Mutex<NoopRawMutex, CommState>,
-    Mutex<NoopRawMutex, TrickleState>,
-    Signal<NoopRawMutex, ()>,
+// Direction-specific state (one per neighbor direction)
+struct DirectionState {
+    comm_state: Mutex<NoopRawMutex, CommState>,
+    trickle_state: Mutex<NoopRawMutex, TrickleState<'static>>,
+    trickle_signal: Signal<NoopRawMutex, ()>,
+}
+
+static NORTH_STATE: StaticCell<DirectionState> = StaticCell::new();
+static SOUTH_STATE: StaticCell<DirectionState> = StaticCell::new();
+static EAST_STATE: StaticCell<DirectionState> = StaticCell::new();
+static WEST_STATE: StaticCell<DirectionState> = StaticCell::new();
+
+// Shared state across all directions
+static GLOBAL_STATE: StaticCell<(
     Mutex<NoopRawMutex, bool>,
     Mutex<NoopRawMutex, BlState>,
     Mutex<NoopRawMutex, Flash>,
     Channel<NoopRawMutex, proto::BlCodeWrite, 1>,
+    Signal<NoopRawMutex, ()>,
 )> = StaticCell::new();
 
 enum BlState {
@@ -153,26 +159,58 @@ async fn branch_task(
     did_receive_packet: &'static Mutex<NoopRawMutex, bool>,
     bl_state: &'static Mutex<NoopRawMutex, BlState>,
     flash: &'static Mutex<NoopRawMutex, Flash>,
+    validate_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
-    Timer::after_millis(500).await;
-    // If no bootloader packets were received in the first 500ms,
-    // validate and branch to the app.
-    {
-        let did_receive_packet = did_receive_packet
-            .try_lock()
-            .expect("did_receive_packet should not be held across .awaits");
-        if !*did_receive_packet {
+    use embassy_futures::select::{Either, select};
+
+    // Wait for either 500ms timeout or validation signal
+    match select(Timer::after_millis(500), validate_signal.wait()).await {
+        Either::First(_) => {
+            // Timer expired - check if we should auto-validate
+            let did_receive_packet = {
+                let did_receive_packet = did_receive_packet
+                    .try_lock()
+                    .expect("did_receive_packet should not be held across .awaits");
+                *did_receive_packet
+            };
+            if !did_receive_packet {
+                // Safety: we are not in an interrupt
+                let mut flash_guard = flash.lock().await;
+                let mut bl_state_guard = bl_state
+                    .try_lock()
+                    .expect("bl_state lock should not be held across .awaits");
+                unsafe {
+                    validate_and_branch_to_app(&mut *bl_state_guard, &mut *flash_guard);
+                }
+            }
+        }
+        Either::Second(_) => {
+            // Validation signal received during initial 500ms
+            Timer::after_millis(80).await; // Wait 80ms for propagation of message
             // Safety: we are not in an interrupt
+            let mut flash_guard = flash.lock().await;
             let mut bl_state_guard = bl_state
                 .try_lock()
                 .expect("bl_state lock should not be held across .awaits");
             unsafe {
-                validate_and_branch_to_app(&mut *bl_state_guard, flash).await;
+                validate_and_branch_to_app(&mut *bl_state_guard, &mut *flash_guard);
             }
         }
     }
-    // Wait forever
-    core::future::pending::<()>().await;
+
+    // Wait for validation signals from handle_new_message
+    loop {
+        validate_signal.wait().await;
+        Timer::after_millis(80).await; // Wait 80ms for propagation of message
+        // Safety: we are not in an interrupt
+        let mut flash_guard = flash.lock().await;
+        let mut bl_state_guard = bl_state
+            .try_lock()
+            .expect("bl_state lock should not be held across .awaits");
+        unsafe {
+            validate_and_branch_to_app(&mut *bl_state_guard, &mut *flash_guard);
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -427,15 +465,14 @@ async fn flash_writer_task(
 
 #[embassy_executor::task(pool_size = 4)]
 async fn rx_task(
-    name: &'static str,
+    direction: Direction,
     mut usart_rx: UsartRx,
-    comm_state: &'static Mutex<NoopRawMutex, CommState>,
-    trickle_state: &'static Mutex<NoopRawMutex, TrickleState<'static>>,
-    trickle_signal: &'static Signal<NoopRawMutex, ()>,
+    direction_state: &'static DirectionState,
+    other_direction_states: [(Direction, &'static DirectionState); 3],
     did_receive_packet: &'static Mutex<NoopRawMutex, bool>,
     bl_state: &'static Mutex<NoopRawMutex, BlState>,
     flash_channel: &'static Channel<NoopRawMutex, proto::BlCodeWrite, 1>,
-    flash: &'static Mutex<NoopRawMutex, Flash>,
+    validate_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
     let mut rx_buffer = heapless::Vec::<_, MAX_PACKET_LEN>::new();
     let mut overrun = false;
@@ -452,7 +489,7 @@ async fn rx_task(
                 // Decode slice if it is non-zero length and not overrun
                 if i > 0 && !overrun {
                     // Deserialize rx_buffer[..i]
-                    defmt::trace!("RX from {} framed bytes: {:?}", name, &rx_buffer[..=i]);
+                    defmt::trace!("RX from {} framed bytes: {:?}", direction, &rx_buffer[..=i]);
                     if let Ok(received_comm_state) =
                         CommState::try_deserialize_packet(&mut rx_buffer[..=i]).map_err(|e| {
                             defmt::debug!("RX err: {:?}", defmt::Debug2Format(&e));
@@ -460,100 +497,86 @@ async fn rx_task(
                         })
                     {
                         let now = Instant::now();
-                        defmt::debug!("RX {}: packet {:?}", name, received_comm_state);
+                        defmt::debug!("RX {}: packet {:?}", direction, received_comm_state);
                         // We got a valid packet--update the state
 
-                        let mut trickle_state = trickle_state
-                            .try_lock()
-                            .expect("trickle lock should not be held across .awaits");
-
-                        let mut comm_state = comm_state
+                        let mut comm_state = direction_state
+                            .comm_state
                             .try_lock()
                             .expect("comm_state lock should not be held across .awaits");
-                        match comm_state.consider(&received_comm_state) {
-                            TrickleOrdering::Greater => {
-                                // Receiving a newer state means that we should assume it.
-                                *comm_state = received_comm_state;
-                                comm_state.update(now);
+                        let merge_result = comm_state.merge(&received_comm_state);
 
-                                // Handle special states
+                        if merge_result.newer {
+                            // Update the message itself,
+                            // and/or the system state (bl_state)
+                            {
                                 let mut bl_state = bl_state
                                     .try_lock()
                                     .expect("bl_state lock should not be held across .awaits");
+                                handle_new_message(
+                                    direction,
+                                    &mut *comm_state,
+                                    &mut *bl_state,
+                                    flash_channel,
+                                    validate_signal,
+                                );
+                            }
 
-                                let CommState { seq_num, type_ } = &mut *comm_state;
-                                match type_ {
-                                    CommType::Unknown => {
-                                        // Validate and reboot into app
-                                        // Safety: we are not in an interrupt
-                                        unsafe {
-                                            validate_and_branch_to_app(&mut *bl_state, flash).await;
-                                        }
-                                    }
-                                    CommType::BlInit => {
-                                        *bl_state = BlState::Init;
-                                    }
-                                    CommType::BlBroadcastPing(bl_broadcast_ping) => {
-                                        match *bl_state {
-                                            BlState::Ping(sn) if sn == *seq_num => {
-                                                // If we've already seen this ping, there is nothing to
-                                                // alter about it
-                                            }
-                                            _ => {
-                                                // If this is the first time we've seen this ping,
-                                                // mark it with our observed latency.
-                                                bl_broadcast_ping.latency_micros =
-                                                    bl_broadcast_ping.age_micros.age_micros;
-                                                *bl_state = BlState::Ping(comm_state.seq_num)
-                                            }
-                                        }
-                                    }
-                                    CommType::BlCodeWrite(bl_code_write) => {
-                                        // Send the flash write message to the flash writer task
-                                        // if this message is for us (hardware ID matches)
-                                        if bl_code_write.hardware_id == HARDWARE_ID {
-                                            let _ = flash_channel.try_send(bl_code_write.clone());
-                                        }
-                                    }
-                                    CommType::BlCodeProgress(bl_code_progress) => {
-                                        let chunk_index = match *bl_state {
-                                            BlState::CodeWrite { chunk_index, .. } => chunk_index,
-                                            _ => 0,
-                                        };
-                                        bl_code_progress.chunk_count =
-                                            bl_code_progress.chunk_count.min(chunk_index);
-                                    }
-                                    CommType::BlIndicateGood => {
-                                        *bl_state = BlState::IndicateGood;
-                                    }
-                                    CommType::BlUnknown => {}
-                                    #[cfg(test)]
-                                    CommType::TestAppUnknown(_) => unreachable!(),
-                                    #[cfg(test)]
-                                    CommType::TestBlUnknown(_) => unreachable!(),
-                                }
+                            // Handle propagation
+                            // (including updating trickle algorithm for other directions)
+                            {
+                                for (other_direction, other_direction_state) in
+                                    other_direction_states
                                 {
-                                    let mut did_receive_packet =
-                                        did_receive_packet.try_lock().expect(
-                                            "did_receive_packet should not be held across .awaits",
+                                    let mut other_comm_state =
+                                        other_direction_state.comm_state.try_lock().expect(
+                                            "comm_state lock should not be held across .awaits",
                                         );
-                                    *did_receive_packet = true;
-                                }
 
-                                trickle_state.got_new_state(now);
+                                    propagate_comm_state(
+                                        direction,
+                                        &mut *comm_state,
+                                        other_direction,
+                                        &mut *other_comm_state,
+                                    );
+                                    // Bootloader has very simple propagation:
+                                    // clone an exact copy to all other directions
+                                    *other_comm_state = comm_state.clone();
+
+                                    let mut other_trickle_state = other_direction_state
+                                        .trickle_state
+                                        .try_lock()
+                                        .expect("trickle lock should not be held across .awaits");
+                                    other_trickle_state.got_inconsistent_state(now);
+                                    // Wake the event loop
+                                    other_direction_state.trickle_signal.signal(());
+                                }
                             }
-                            TrickleOrdering::Consistent => {
-                                trickle_state.got_consistent_state();
-                            }
-                            TrickleOrdering::Less => {
-                                trickle_state.got_outdated_state(now);
+                            {
+                                let mut did_receive_packet = did_receive_packet
+                                    .try_lock()
+                                    .expect("did_receive_packet should not be held across .awaits");
+                                *did_receive_packet = true;
                             }
                         }
 
-                        // Wake the event loop
-                        trickle_signal.signal(());
+                        // Update the trickle algorithm for this direction
+                        {
+                            let mut trickle_state = direction_state
+                                .trickle_state
+                                .try_lock()
+                                .expect("trickle lock should not be held across .awaits");
+                            if merge_result == MergeResult::CONSISTENT {
+                                trickle_state.got_consistent_state();
+                            } else {
+                                trickle_state.got_inconsistent_state(now);
+                                // Wake the event loop
+                                direction_state.trickle_signal.signal(());
+                            }
+                        }
                     }
                 }
+
                 // Shift buffer contents left & clear overrun flag
                 rx_buffer.drain(..=i);
                 overrun = false;
@@ -565,23 +588,88 @@ async fn rx_task(
         if rx_buffer.is_full() {
             overrun = true;
             rx_buffer.clear();
-            defmt::info!("{} Overrun", name);
+            defmt::info!("{} Overrun", direction);
         }
     }
 }
 
-#[embassy_executor::task()]
-async fn tx_task(
-    mut usarts_tx: [UsartTx; 4],
-    comm_state: &'static Mutex<NoopRawMutex, CommState>,
-    trickle_state: &'static Mutex<NoopRawMutex, TrickleState<'static>>,
-    trickle_signal: &'static Signal<NoopRawMutex, ()>,
+fn handle_new_message(
+    _direction: Direction,
+    comm_state: &mut CommState,
+    bl_state: &mut BlState,
+    flash_channel: &'static Channel<NoopRawMutex, proto::BlCodeWrite, 1>,
+    validate_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
-    let mut tx_buffers: [_; 4] = core::array::from_fn(|_| [0_u8; MAX_PACKET_LEN + 1]);
+    // Handle updating bl_state
+    // and altering the received state, if needed
+
+    let CommState { seq_num, type_ } = &mut *comm_state;
+    match type_ {
+        CommType::Unknown => {
+            // Validate and reboot into app
+            // Signal branch_task to validate and branch to app
+            validate_signal.signal(());
+        }
+        CommType::BlInit => {
+            *bl_state = BlState::Init;
+        }
+        CommType::BlBroadcastPing(bl_broadcast_ping) => {
+            match *bl_state {
+                BlState::Ping(sn) if sn == *seq_num => {
+                    // If we've already seen this ping, there is nothing to
+                    // alter about it
+                }
+                _ => {
+                    // If this is the first time we've seen this ping,
+                    // mark it with our observed latency.
+                    bl_broadcast_ping.latency_micros = bl_broadcast_ping.age_micros.age_micros;
+                    *bl_state = BlState::Ping(comm_state.seq_num)
+                }
+            }
+        }
+        CommType::BlCodeWrite(bl_code_write) => {
+            // Send the flash write message to the flash writer task
+            // if this message is for us (hardware ID matches)
+            if bl_code_write.hardware_id == HARDWARE_ID {
+                let _ = flash_channel.try_send(bl_code_write.clone());
+            }
+        }
+        CommType::BlCodeProgress(bl_code_progress) => {
+            let chunk_index = match *bl_state {
+                BlState::CodeWrite { chunk_index, .. } => chunk_index,
+                _ => 0,
+            };
+            bl_code_progress.chunk_count = bl_code_progress.chunk_count.min(chunk_index);
+        }
+        CommType::BlIndicateGood => {
+            *bl_state = BlState::IndicateGood;
+        }
+        CommType::BlUnknown => {}
+    }
+}
+
+fn propagate_comm_state(
+    _from_dir: Direction,
+    from_comm_state: &CommState,
+    _to_dir: Direction,
+    to_comm_state: &mut CommState,
+) -> bool {
+    *to_comm_state = from_comm_state.clone();
+    true
+}
+
+#[embassy_executor::task(pool_size = 4)]
+async fn tx_task(
+    direction: Direction,
+    mut usart_tx: UsartTx,
+    direction_state: &'static DirectionState,
+) {
+    let mut tx_buffer = [0_u8; MAX_PACKET_LEN + 1];
     loop {
         let now = Instant::now();
 
-        let mut trickle_state = trickle_state
+        let mut trickle_state = direction_state
+            .trickle_state
             .try_lock()
             .expect("trickle lock should not be held across .awaits");
         match trickle_state.poll(now) {
@@ -591,48 +679,29 @@ async fn tx_task(
 
                 // Wait for the alotted time,
                 // or until we are interrupted from rx_task
-                let _ = trickle_signal
+                let _ = direction_state
+                    .trickle_signal
                     .wait()
                     .with_timeout(Duration::from_micros(timeout_micros))
                     .await;
             }
             TricklePollResult::Send => {
-                let mut comm_state = comm_state
+                let mut comm_state = direction_state
+                    .comm_state
                     .try_lock()
                     .expect("comm_state lock should not be held across .awaits");
                 comm_state.update(now);
-                let propagated = comm_state.propagate();
 
-                let lens: [_; 4] = core::array::from_fn(|i| {
-                    let transmit_comm_state = &propagated[i];
-                    defmt::debug!(
-                        "TX {}: {:?}",
-                        ["North", "South", "East", "West"][i],
-                        &transmit_comm_state
-                    );
-                    let tx_buffer = &mut tx_buffers[i];
-                    // We retain an initial '\0' to improve packet start detection
-                    let len = transmit_comm_state
-                        .serialize_packet(&mut tx_buffer[1..])
-                        .len()
-                        + 1;
-                    len
-                });
+                defmt::debug!("TX {}: {:?}", direction, &*comm_state);
 
-                // Would be nice to find a cleaner way to do this...
-                let [u0, u1, u2, u3] = &mut usarts_tx;
+                // We retain an initial '\0' to improve packet start detection
+                let len = comm_state.serialize_packet(&mut tx_buffer[1..]).len() + 1;
 
                 // drop the locks before .await
                 drop(trickle_state);
                 drop(comm_state);
 
-                join_array([
-                    u0.write(&tx_buffers[0][..lens[0]]),
-                    u1.write(&tx_buffers[1][..lens[1]]),
-                    u2.write(&tx_buffers[2][..lens[2]]),
-                    u3.write(&tx_buffers[3][..lens[3]]),
-                ])
-                .await;
+                usart_tx.write(&tx_buffer[..len]).await;
             }
         }
     }
@@ -643,7 +712,7 @@ fn main() -> ! {
     let Hardware {
         leds,
         led_pwr,
-        usarts_tx,
+        usarts_tx: [north_tx, south_tx, east_tx, west_tx],
         usarts_rx: [north_rx, south_rx, east_rx, west_rx],
         flash,
         watchdog,
@@ -659,57 +728,127 @@ fn main() -> ! {
     // Seed RNG with unique chip identifier
     let seed = (((chip_id[0] as u64) << 32) | (chip_id[1] as u64)) ^ (chip_id[2] as u64);
     let now = Instant::now();
-    let comm_state = Mutex::new(CommState::default());
-    let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed));
-    let trickle_signal = Signal::new();
+
+    // Initialize direction-specific states
+    let north_state = NORTH_STATE.init(DirectionState {
+        comm_state: Mutex::new(CommState::default()),
+        trickle_state: Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed)),
+        trickle_signal: Signal::new(),
+    });
+
+    let south_state = SOUTH_STATE.init(DirectionState {
+        comm_state: Mutex::new(CommState::default()),
+        trickle_state: Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed ^ 1)),
+        trickle_signal: Signal::new(),
+    });
+
+    let east_state = EAST_STATE.init(DirectionState {
+        comm_state: Mutex::new(CommState::default()),
+        trickle_state: Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed ^ 2)),
+        trickle_signal: Signal::new(),
+    });
+
+    let west_state = WEST_STATE.init(DirectionState {
+        comm_state: Mutex::new(CommState::default()),
+        trickle_state: Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed ^ 3)),
+        trickle_signal: Signal::new(),
+    });
+
+    // Initialize shared state
     let did_receive_packet = Mutex::new(false);
     let bl_state = Mutex::new(BlState::Init);
     let flash = Mutex::new(flash);
     let flash_channel = Channel::new();
-    let (
-        comm_state,
-        trickle_state,
-        trickle_signal,
-        did_receive_packet,
-        bl_state,
-        flash,
-        flash_channel,
-    ) = STATE.init((
-        comm_state,
-        trickle_state,
-        trickle_signal,
-        did_receive_packet,
-        bl_state,
-        flash,
-        flash_channel,
-    ));
+    let validate_signal = Signal::new();
+    let (did_receive_packet, bl_state, flash, flash_channel, validate_signal) =
+        GLOBAL_STATE.init((
+            did_receive_packet,
+            bl_state,
+            flash,
+            flash_channel,
+            validate_signal,
+        ));
 
     executor.run(|spawner| {
-        spawner.spawn(branch_task(did_receive_packet, bl_state, flash).unwrap());
+        spawner.spawn(branch_task(did_receive_packet, bl_state, flash, validate_signal).unwrap());
         spawner.spawn(led_pwr_task(led_pwr).unwrap());
         spawner.spawn(led_task(leds, bl_state, watchdog).unwrap());
         spawner.spawn(flash_writer_task(flash_channel, flash, bl_state).unwrap());
-        for (name, rx) in [
-            ("North", north_rx),
-            ("South", south_rx),
-            ("East", east_rx),
-            ("West", west_rx),
-        ] {
-            spawner.spawn(
-                rx_task(
-                    name,
-                    rx,
-                    comm_state,
-                    trickle_state,
-                    trickle_signal,
-                    did_receive_packet,
-                    bl_state,
-                    flash_channel,
-                    flash,
-                )
-                .unwrap(),
-            );
-        }
-        spawner.spawn(tx_task(usarts_tx, comm_state, trickle_state, trickle_signal).unwrap());
+
+        // Spawn RX tasks for each direction
+        spawner.spawn(
+            rx_task(
+                Direction::North,
+                north_rx,
+                north_state,
+                [
+                    (Direction::South, south_state),
+                    (Direction::East, east_state),
+                    (Direction::West, west_state),
+                ],
+                did_receive_packet,
+                bl_state,
+                flash_channel,
+                validate_signal,
+            )
+            .unwrap(),
+        );
+        spawner.spawn(
+            rx_task(
+                Direction::South,
+                south_rx,
+                south_state,
+                [
+                    (Direction::North, north_state),
+                    (Direction::East, east_state),
+                    (Direction::West, west_state),
+                ],
+                did_receive_packet,
+                bl_state,
+                flash_channel,
+                validate_signal,
+            )
+            .unwrap(),
+        );
+        spawner.spawn(
+            rx_task(
+                Direction::East,
+                east_rx,
+                east_state,
+                [
+                    (Direction::North, north_state),
+                    (Direction::South, south_state),
+                    (Direction::West, west_state),
+                ],
+                did_receive_packet,
+                bl_state,
+                flash_channel,
+                validate_signal,
+            )
+            .unwrap(),
+        );
+        spawner.spawn(
+            rx_task(
+                Direction::West,
+                west_rx,
+                west_state,
+                [
+                    (Direction::North, north_state),
+                    (Direction::South, south_state),
+                    (Direction::East, east_state),
+                ],
+                did_receive_packet,
+                bl_state,
+                flash_channel,
+                validate_signal,
+            )
+            .unwrap(),
+        );
+
+        // Spawn TX tasks for each direction
+        spawner.spawn(tx_task(Direction::North, north_tx, north_state).unwrap());
+        spawner.spawn(tx_task(Direction::South, south_tx, south_state).unwrap());
+        spawner.spawn(tx_task(Direction::East, east_tx, east_state).unwrap());
+        spawner.spawn(tx_task(Direction::West, west_tx, west_state).unwrap());
     });
 }

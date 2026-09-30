@@ -1642,3 +1642,11 @@ impl Flash {
         });
     }
 }
+
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub enum Direction {
+    North,
+    South,
+    East,
+    West,
+}

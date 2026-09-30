@@ -528,6 +528,7 @@ pub struct BlBroadcastPing {
     pub data: heapless::Vec<u8, 256>,
 }
 
+#[cfg(feature = "bl")]
 impl BlBroadcastPing {
     pub fn update(&mut self, now: Instant) {
         self.age_micros.update(now);
