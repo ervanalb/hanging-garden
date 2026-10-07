@@ -846,7 +846,7 @@ impl Hardware {
         });
 
         // Wait for ADC to stabilize (typically a few microseconds)
-        riscv::asm::delay(1000);
+        riscv::asm::delay(100_000);
 
         // Calibrate ADC1
         pac::ADC1.ctlr2().modify(|w| w.set_cal(true));
@@ -862,10 +862,10 @@ impl Hardware {
             w.set_extsel(Extsel::SWSTART); // Software trigger (SWSTART)
         });
 
-        // Set sample time for channels 6 and 7 (13.5 cycles)
+        // Set sample time for channels 6 and 7
         pac::ADC1.samptr2().modify(|w| {
-            w.set_smp(6, SampleTime::CYCLES13_5);
-            w.set_smp(7, SampleTime::CYCLES13_5);
+            w.set_smp(6, SampleTime::CYCLES28_5);
+            w.set_smp(7, SampleTime::CYCLES28_5);
         });
 
         // Set sequence length to 1 (single channel conversion)

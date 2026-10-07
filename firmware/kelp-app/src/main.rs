@@ -3,7 +3,7 @@
 
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
-use hal::{Direction, Hardware, Leds, Touch, UsartRx, UsartTx, Watchdog};
+use hal::{Direction, Flash, Hardware, LedPwr, Leds, Touch, UsartRx, UsartTx, Watchdog};
 use proto::{CommState, CommType, MAX_PACKET_LEN, MergeResult, TRICKLE_PARAMS};
 use static_cell::StaticCell;
 use trickle::{TricklePollResult, TrickleState};
@@ -22,10 +22,50 @@ static SOUTH_STATE: StaticCell<DirectionState> = StaticCell::new();
 static EAST_STATE: StaticCell<DirectionState> = StaticCell::new();
 static WEST_STATE: StaticCell<DirectionState> = StaticCell::new();
 
-static GLOBAL_STATE: StaticCell<(Mutex<NoopRawMutex, AppState>, Signal<NoopRawMutex, ()>)> =
-    StaticCell::new();
+static GLOBAL_STATE: StaticCell<(
+    Mutex<NoopRawMutex, AppState>,
+    Signal<NoopRawMutex, ()>,
+    Config,
+)> = StaticCell::new();
 
 struct AppState;
+
+#[derive(defmt::Format)]
+#[repr(C)]
+struct Config {
+    magic: u32,
+    pixel_count: u32,
+}
+
+/// Configuration structure placed in APP_CONFIG_USR section
+#[unsafe(link_section = ".app_config_usr")]
+#[used]
+static CONFIG: Config = Config {
+    magic: 0,
+    pixel_count: 0,
+};
+
+const CONFIG_MAGIC: u32 = 0x9ad69d84;
+
+impl Config {
+    fn read_volatile(ptr: *const Config) -> Option<Self> {
+        let config = unsafe { core::ptr::read_volatile(ptr) };
+        if config.magic != CONFIG_MAGIC {
+            defmt::warn!("Invalid magic number in config: 0x{:08X}", config.magic);
+            return None;
+        }
+        if config.pixel_count > MAX_PIXEL_COUNT as u32 {
+            defmt::warn!(
+                "Invalid pixel count in config: 0x{:08X}",
+                config.pixel_count
+            );
+            return None;
+        }
+        Some(config)
+    }
+}
+
+const MAX_PIXEL_COUNT: usize = 120;
 
 /// Convert HSV to RGB color space using integer math
 /// h: hue [0, 1535] representing 0-360 degrees scaled by 256/60
@@ -110,11 +150,10 @@ impl TouchState {
 }
 
 #[embassy_executor::task]
-async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog) {
-    const NUM_PIXELS: usize = 120;
+async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog, config: &'static Config) {
     const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
 
-    let mut buffer = [0u8; NUM_PIXELS * 3];
+    let mut buffer = [0u8; MAX_PIXEL_COUNT * 3];
     let mut time_offset: u16 = 0;
 
     let mut touch_state = TouchState::new();
@@ -124,16 +163,16 @@ async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog) {
         let touched = touch_state.update(&mut touch).await;
 
         // Generate rainbow pattern
-        for pixel in 0..NUM_PIXELS {
+        for pixel in 0..config.pixel_count {
             // Hue varies with position: spread across full color wheel
-            let position_hue = (pixel * 1536 / NUM_PIXELS) as u16;
+            let position_hue = (pixel * 1536 / config.pixel_count) as u16;
             let hue = (position_hue + time_offset) % 1536;
 
             let (r, g, b) = gamma_correct(hsv2rgb(hue as u16, 255, if touched { 100 } else { 25 }));
 
-            buffer[pixel * 3] = g;
-            buffer[pixel * 3 + 1] = r;
-            buffer[pixel * 3 + 2] = b;
+            buffer[(pixel * 3) as usize] = g;
+            buffer[(pixel * 3 + 1) as usize] = r;
+            buffer[(pixel * 3 + 2) as usize] = b;
         }
 
         let _ = leds.write_slice(&buffer);
@@ -350,7 +389,7 @@ async fn led_pwr_task(mut led_pwr: hal::LedPwr) {
     loop {
         // Set LED power on
         led_pwr.set_pwr(true);
-        Timer::after_millis(100).await; // Weather initial power-on transient
+        Timer::after_millis(100).await;
 
         loop {
             // Read current at 100Hz (every 10ms)
@@ -387,21 +426,183 @@ async fn branch_task(bootloader_signal: &'static Signal<NoopRawMutex, ()>) {
     }
 }
 
-#[qingke_rt::entry]
-fn main() -> ! {
-    let Hardware {
-        leds,
-        led_pwr,
-        usarts_tx: [north_tx, south_tx, east_tx, west_tx],
-        usarts_rx: [north_rx, south_rx, east_rx, west_rx],
-        flash: _,
-        watchdog,
-        chip_id,
-        touch,
-    } = Hardware::init();
+async fn get_or_discover_config(
+    flash: &mut Flash,
+    leds: &mut Leds,
+    led_pwr: &mut LedPwr,
+    watchdog: &Watchdog,
+) -> Config {
+    // Read the config from flash if it is valid
+    if let Some(config) = Config::read_volatile(&CONFIG) {
+        return config;
+    }
 
-    // Create executor
-    let executor = EXECUTOR.init(embassy_executor::Executor::new());
+    // Count pixels using current measurement
+    const AVG_COUNT: usize = 128;
+    let mut buffer = [0u8; (MAX_PIXEL_COUNT + 1) * 3];
+    led_pwr.set_pwr(true);
+    Timer::after_millis(100).await;
+    let _ = leds.write_slice(&buffer);
+    Timer::after_millis(10).await;
+    let mut current_dark: u32 = 0;
+    for _ in 0..AVG_COUNT {
+        current_dark += led_pwr.read_current().await as u32;
+    }
+    watchdog.feed();
+    // Set first pixel to all white
+    buffer[0..3].clone_from_slice(&[0xFF; 3]);
+    let _ = leds.write_slice(&buffer);
+    buffer[0..3].clone_from_slice(&[0x00; 3]);
+    Timer::after_millis(10).await;
+    let mut current_light: u32 = 0;
+    for _ in 0..AVG_COUNT {
+        current_light += led_pwr.read_current().await as u32;
+    }
+    watchdog.feed();
+
+    const RADIUS: u32 = (AVG_COUNT as u32) / 2; // 0.5 ADC count
+
+    // Require a minimum difference of 3 * RADIUS
+    if current_light < current_dark + (3 * RADIUS) || current_dark < RADIUS {
+        defmt::error!(
+            "Bad current readings (dark: {}, light: {})",
+            current_dark,
+            current_light
+        );
+        return Config {
+            magic: CONFIG_MAGIC,
+            pixel_count: 10,
+        };
+    }
+
+    // Linear search for the end of the strip
+    let mut pixel_count = 1;
+    for i in 1..MAX_PIXEL_COUNT {
+        // Set given pixel to all white
+        buffer[i * 3..i * 3 + 3].clone_from_slice(&[0xFF; 3]);
+        let _ = leds.write_slice(&buffer);
+        buffer[i * 3..i * 3 + 3].clone_from_slice(&[0x00; 3]);
+        Timer::after_millis(10).await;
+        let mut current: u32 = 0;
+        for _ in 0..AVG_COUNT {
+            current += led_pwr.read_current().await as u32;
+        }
+        watchdog.feed();
+
+        if current >= current_dark - RADIUS && current < current_dark + RADIUS {
+            // Found a dark pixel--stop counting
+            break;
+        } else if current >= current_light - RADIUS && current < current_light + RADIUS {
+            pixel_count = i as u32 + 1;
+            // Continue counting
+        } else {
+            // Pixel is not dark or light--error
+            defmt::error!(
+                "Bad current reading of {} (dark: {}, light: {})",
+                current,
+                current_dark,
+                current_light
+            );
+            return Config {
+                magic: CONFIG_MAGIC,
+                pixel_count: 10,
+            };
+        }
+    }
+
+    // Confirm 3 times that we correctly found the end of the strip
+    for _ in 0..3 {
+        // Set last pixel to all white
+        buffer[3 * (pixel_count - 1) as usize..3 * pixel_count as usize]
+            .clone_from_slice(&[0xFF; 3]);
+        let _ = leds.write_slice(&buffer);
+        buffer[3 * (pixel_count - 1) as usize..3 * pixel_count as usize]
+            .clone_from_slice(&[0x00; 3]);
+        Timer::after_millis(10).await;
+        let mut current: u32 = 0;
+        for _ in 0..AVG_COUNT {
+            current += led_pwr.read_current().await as u32;
+        }
+        if !(current >= current_light - RADIUS && current < current_light + RADIUS) {
+            // Pixel was expected to be light, but it was not
+            defmt::error!(
+                "Bad confirmation reading of {} (expected light: {})",
+                current,
+                current_light
+            );
+            return Config {
+                magic: CONFIG_MAGIC,
+                pixel_count: 10,
+            };
+        }
+
+        // Set pixel after the last to all white
+        buffer[3 * pixel_count as usize..3 * (pixel_count as usize + 1)]
+            .clone_from_slice(&[0xFF; 3]);
+        let _ = leds.write_slice(&buffer);
+        buffer[3 * pixel_count as usize..3 * (pixel_count as usize + 1)]
+            .clone_from_slice(&[0x00; 3]);
+        Timer::after_millis(10).await;
+        let mut current: u32 = 0;
+        for _ in 0..AVG_COUNT {
+            current += led_pwr.read_current().await as u32;
+        }
+        if !(current >= current_dark - RADIUS && current < current_dark + RADIUS) {
+            // Pixel was expected to be dark, but it was not
+            defmt::error!(
+                "Bad confirmation reading of {} (expected dark: {})",
+                current,
+                current_dark
+            );
+            return Config {
+                magic: CONFIG_MAGIC,
+                pixel_count: 10,
+            };
+        }
+
+        watchdog.feed();
+    }
+
+    let config = Config {
+        magic: CONFIG_MAGIC,
+        pixel_count,
+    };
+
+    defmt::info!("Writing new config: {}", &config);
+
+    let config_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &config as *const Config as *const u8,
+            core::mem::size_of::<Config>(),
+        )
+    };
+
+    let config_address = &CONFIG as *const Config as u32;
+    flash.write_page(config_address, config_bytes).await;
+    defmt::info!("Config written to flash");
+
+    config
+}
+
+#[embassy_executor::task]
+async fn init(
+    spawner: embassy_executor::Spawner,
+    mut led_pwr: LedPwr,
+    mut leds: Leds,
+    touch: Touch,
+    watchdog: Watchdog,
+    chip_id: [u32; 3],
+    mut flash: Flash,
+    north_tx: UsartTx,
+    south_tx: UsartTx,
+    east_tx: UsartTx,
+    west_tx: UsartTx,
+    north_rx: UsartRx,
+    south_rx: UsartRx,
+    east_rx: UsartRx,
+    west_rx: UsartRx,
+) {
+    let config = get_or_discover_config(&mut flash, &mut leds, &mut led_pwr, &watchdog).await;
 
     // Seed RNG with unique chip identifier
     let seed = (((chip_id[0] as u64) << 32) | (chip_id[1] as u64)) ^ (chip_id[2] as u64);
@@ -435,78 +636,105 @@ fn main() -> ! {
     // Initialize shared state
     let app_state = Mutex::new(AppState);
     let bootloader_signal = Signal::new();
-    let (app_state, bootloader_signal) = GLOBAL_STATE.init((app_state, bootloader_signal));
+    let (app_state, bootloader_signal, config) =
+        GLOBAL_STATE.init((app_state, bootloader_signal, config));
+
+    spawner.spawn(led_pwr_task(led_pwr).unwrap());
+    spawner.spawn(main_task(leds, touch, watchdog, config).unwrap());
+    spawner.spawn(branch_task(bootloader_signal).unwrap());
+
+    // Spawn RX tasks for each direction
+    spawner.spawn(
+        rx_task(
+            Direction::North,
+            north_rx,
+            north_state,
+            [
+                (Direction::South, south_state),
+                (Direction::East, east_state),
+                (Direction::West, west_state),
+            ],
+            app_state,
+            bootloader_signal,
+        )
+        .unwrap(),
+    );
+    spawner.spawn(
+        rx_task(
+            Direction::South,
+            south_rx,
+            south_state,
+            [
+                (Direction::North, north_state),
+                (Direction::East, east_state),
+                (Direction::West, west_state),
+            ],
+            app_state,
+            bootloader_signal,
+        )
+        .unwrap(),
+    );
+    spawner.spawn(
+        rx_task(
+            Direction::East,
+            east_rx,
+            east_state,
+            [
+                (Direction::North, north_state),
+                (Direction::South, south_state),
+                (Direction::West, west_state),
+            ],
+            app_state,
+            bootloader_signal,
+        )
+        .unwrap(),
+    );
+    spawner.spawn(
+        rx_task(
+            Direction::West,
+            west_rx,
+            west_state,
+            [
+                (Direction::North, north_state),
+                (Direction::South, south_state),
+                (Direction::East, east_state),
+            ],
+            app_state,
+            bootloader_signal,
+        )
+        .unwrap(),
+    );
+
+    // Spawn TX tasks for each direction
+    spawner.spawn(tx_task(Direction::North, north_tx, north_state).unwrap());
+    spawner.spawn(tx_task(Direction::South, south_tx, south_state).unwrap());
+    spawner.spawn(tx_task(Direction::East, east_tx, east_state).unwrap());
+    spawner.spawn(tx_task(Direction::West, west_tx, west_state).unwrap());
+}
+
+#[qingke_rt::entry]
+fn main() -> ! {
+    let Hardware {
+        leds,
+        led_pwr,
+        usarts_tx: [north_tx, south_tx, east_tx, west_tx],
+        usarts_rx: [north_rx, south_rx, east_rx, west_rx],
+        flash,
+        watchdog,
+        chip_id,
+        touch,
+    } = Hardware::init();
+
+    // Create executor
+    let executor = EXECUTOR.init(embassy_executor::Executor::new());
 
     executor.run(|spawner| {
-        spawner.spawn(led_pwr_task(led_pwr).unwrap());
-        spawner.spawn(main_task(leds, touch, watchdog).unwrap());
-        spawner.spawn(branch_task(bootloader_signal).unwrap());
-        // Spawn RX tasks for each direction
         spawner.spawn(
-            rx_task(
-                Direction::North,
-                north_rx,
-                north_state,
-                [
-                    (Direction::South, south_state),
-                    (Direction::East, east_state),
-                    (Direction::West, west_state),
-                ],
-                app_state,
-                bootloader_signal,
+            init(
+                spawner, led_pwr, leds, touch, watchdog, chip_id, flash, north_tx, south_tx,
+                east_tx, west_tx, north_rx, south_rx, east_rx, west_rx,
             )
             .unwrap(),
         );
-        spawner.spawn(
-            rx_task(
-                Direction::South,
-                south_rx,
-                south_state,
-                [
-                    (Direction::North, north_state),
-                    (Direction::East, east_state),
-                    (Direction::West, west_state),
-                ],
-                app_state,
-                bootloader_signal,
-            )
-            .unwrap(),
-        );
-        spawner.spawn(
-            rx_task(
-                Direction::East,
-                east_rx,
-                east_state,
-                [
-                    (Direction::North, north_state),
-                    (Direction::South, south_state),
-                    (Direction::West, west_state),
-                ],
-                app_state,
-                bootloader_signal,
-            )
-            .unwrap(),
-        );
-        spawner.spawn(
-            rx_task(
-                Direction::West,
-                west_rx,
-                west_state,
-                [
-                    (Direction::North, north_state),
-                    (Direction::South, south_state),
-                    (Direction::East, east_state),
-                ],
-                app_state,
-                bootloader_signal,
-            )
-            .unwrap(),
-        );
-
-        // Spawn TX tasks for each direction
-        spawner.spawn(tx_task(Direction::North, north_tx, north_state).unwrap());
-        spawner.spawn(tx_task(Direction::South, south_tx, south_state).unwrap());
-        spawner.spawn(tx_task(Direction::East, east_tx, east_state).unwrap());
-        spawner.spawn(tx_task(Direction::West, west_tx, west_state).unwrap());
     });
 }

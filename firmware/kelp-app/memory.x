@@ -14,3 +14,11 @@ REGION_ALIAS("REGION_HEAP", RAM);
 REGION_ALIAS("REGION_STACK", RAM);
 
 PROVIDE(_sflash = ORIGIN(FLASH));
+
+SECTIONS
+{
+    .app_config_usr (NOLOAD) : ALIGN(4)
+    {
+        *(.app_config_usr .app_config_usr.*);
+    } > APP_CONFIG_USR
+};

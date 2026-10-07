@@ -21,4 +21,4 @@ SECTIONS
     {
         *(.bootloader_config_usr .bootloader_config_usr.*);
     } > BOOTLOADER_CONFIG_USR
-} INSERT AFTER .data;
+};

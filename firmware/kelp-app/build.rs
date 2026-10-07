@@ -2,10 +2,10 @@ use std::fs;
 
 fn main() {
     // Error if building in debug mode
-    let profile = std::env::var("PROFILE").unwrap();
-    if profile == "debug" {
-        panic!("bootloader must be built in release mode. Add the --release flag.");
-    }
+    //let profile = std::env::var("PROFILE").unwrap();
+    //if profile == "debug" {
+    //    panic!("bootloader must be built in release mode. Add the --release flag.");
+    //}
 
     // println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
