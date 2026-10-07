@@ -12,3 +12,4 @@ heapless = "0.9"
 crc = "3.2"
 log = "0.4"
 env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }

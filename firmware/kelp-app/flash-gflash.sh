@@ -8,4 +8,4 @@ BIN_FILE="${ELF_FILE%.elf}.bin"
 rust-objcopy -O binary "$ELF_FILE" "$BIN_FILE"
 
 # Flash using gflash
-gflash /dev/ttyACM1 "$BIN_FILE"
+gflash /dev/ttyACM0 flash "$BIN_FILE"

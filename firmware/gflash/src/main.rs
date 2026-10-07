@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use log::{debug, error, info, trace};
 use proto::{
     BlBroadcastPing, BlCodeProgress, BlCodeWrite, CommState, CommType, MAX_PACKET_LEN, MergeResult,
@@ -9,6 +10,30 @@ use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tokio_serial::SerialPortBuilderExt;
 use trickle::{TricklePollResult, TrickleState};
+
+#[derive(Parser)]
+#[command(name = "gflash")]
+#[command(about = "Flash and control firmware over serial", long_about = None)]
+struct Cli {
+    /// Serial port to use (e.g., /dev/ttyUSB0)
+    serial_port: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Flash firmware to devices
+    Flash {
+        /// Path to firmware binary file
+        firmware_binary: String,
+    },
+    /// Send BlInit packets continuously to switch devices to bootloader mode
+    Bootloader,
+    /// Send BlIndicateGood packets continuously for testing
+    Test,
+}
 
 async fn rx_task(
     serial_rx: tokio::io::ReadHalf<tokio_serial::SerialStream>,
@@ -140,26 +165,21 @@ const CHUNK_SIZE: usize = 256;
 
 static CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_BZIP2);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <serial_port> <firmware_binary>", args[0]);
-        eprintln!("Example: {} /dev/ttyUSB0 firmware.bin", args[0]);
-        std::process::exit(1);
-    }
-
-    let port_name = &args[1];
-    let firmware_path = &args[2];
-
+async fn flash_command(
+    firmware_path: &str,
+    comm_state: &Mutex<CommState>,
+    trickle_state: &Mutex<TrickleState<'static>>,
+    trickle_notify_tx: &watch::Sender<()>,
+    new_comm_state_notify_tx: &watch::Sender<()>,
+    mut new_comm_state_notify_rx: watch::Receiver<()>,
+) {
     // Read firmware binary
-    let firmware_data = std::fs::read(firmware_path)?;
+    let firmware_data = std::fs::read(firmware_path).expect("Failed to read firmware file");
     if firmware_data.is_empty() {
         error!("Error: Firmware file is empty");
         std::process::exit(1);
     }
+
     let chunk_count = (firmware_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
     // Calculate CRC32 of the entire firmware
@@ -174,10 +194,369 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         firmware_crc32
     );
 
-    // Open serial port
-    let port = tokio_serial::new(port_name, 115_200).open_native_async()?;
+    // Switch to bootloader mode
+    let mut seq_num = 0;
+    info!("Switching to bootloader...");
+    let switch_to_bl = async {
+        {
+            let now = Instant::now();
+            let mut comm_state = comm_state
+                .try_lock()
+                .expect("comm_state lock cannot be held across an .await");
+            let mut trickle_state = trickle_state
+                .try_lock()
+                .expect("trickle_state lock cannot be held across an .await");
+            seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+            new_comm_state(
+                CommState {
+                    seq_num,
+                    type_: CommType::BlInit,
+                },
+                &mut *comm_state,
+                &mut *trickle_state,
+                &trickle_notify_tx,
+                &new_comm_state_notify_tx,
+                now,
+            );
+        }
+        loop {
+            new_comm_state_notify_rx.changed().await.unwrap(); // TODO real error handling here
+            let mut comm_state = comm_state
+                .try_lock()
+                .expect("comm_state lock cannot be held across an .await");
+            if comm_state.seq_num > seq_num {
+                // Update with higher seq_num:
+                // One-up the message with an even higher seq_num
+                seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+                let mut trickle_state = trickle_state
+                    .try_lock()
+                    .expect("trickle_state lock cannot be held across an .await");
+                let now = Instant::now();
+                new_comm_state(
+                    CommState {
+                        seq_num,
+                        type_: CommType::BlInit,
+                    },
+                    &mut *comm_state,
+                    &mut *trickle_state,
+                    &trickle_notify_tx,
+                    &new_comm_state_notify_tx,
+                    now,
+                );
+            }
+        }
+    };
+    let _ = timeout(LONG_TIMEOUT, switch_to_bl).await;
 
-    info!("Opened serial port: {}", port_name);
+    info!("Measuring network latency...");
+    {
+        let now = Instant::now();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        let mut trickle_state = trickle_state
+            .try_lock()
+            .expect("trickle_state lock cannot be held across an .await");
+        seq_num = comm_state.seq_num + 1;
+        new_comm_state(
+            CommState {
+                seq_num,
+                type_: CommType::BlBroadcastPing(BlBroadcastPing {
+                    data: heapless::Vec::from_slice(&[0xAA; CHUNK_SIZE]).unwrap(),
+                    ..Default::default()
+                }),
+            },
+            &mut *comm_state,
+            &mut *trickle_state,
+            &trickle_notify_tx,
+            &new_comm_state_notify_tx,
+            now,
+        );
+    }
+
+    tokio::time::sleep(LONG_TIMEOUT).await;
+
+    let latency_micros = {
+        let comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        // Make sure there aren't other messages floating around the network
+        assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
+        match comm_state.type_ {
+            CommType::BlBroadcastPing(BlBroadcastPing { latency_micros, .. }) => latency_micros,
+            _ => panic!("msg type changed unexpectedly on network"), // TODO better error handling
+        }
+    };
+
+    if latency_micros == 0 {
+        panic!("No devices detected on network"); // TODO better error handling
+    }
+
+    info!(
+        " - Measured latency: {} milliseconds",
+        latency_micros / 1_000
+    );
+
+    let mut code_chunk_timeout = INITIAL_CODE_CHUNK_TIMEOUT;
+    let mut first_chunk = 0;
+
+    loop {
+        // Split firmware into 256-byte chunks
+        let firmware_chunks = firmware_data[first_chunk * CHUNK_SIZE..].chunks(CHUNK_SIZE);
+        for (chunk_index, chunk_data) in firmware_chunks.enumerate() {
+            let chunk_index = chunk_index + first_chunk;
+            info!("Write chunk {} / {}", chunk_index, chunk_count);
+            {
+                let now = Instant::now();
+                let mut comm_state = comm_state
+                    .try_lock()
+                    .expect("comm_state lock cannot be held across an .await");
+                let mut trickle_state = trickle_state
+                    .try_lock()
+                    .expect("trickle_state lock cannot be held across an .await");
+                seq_num = comm_state.seq_num + 1;
+                new_comm_state(
+                    CommState {
+                        seq_num,
+                        type_: CommType::BlCodeWrite(BlCodeWrite {
+                            hardware_id: HARDWARE_ID,
+                            firmware_size_bytes: firmware_data.len() as u32,
+                            firmware_crc32,
+                            chunk_index: chunk_index as u32,
+                            chunk_data: heapless::Vec::from_slice(chunk_data).unwrap(),
+                        }),
+                    },
+                    &mut *comm_state,
+                    &mut *trickle_state,
+                    &trickle_notify_tx,
+                    &new_comm_state_notify_tx,
+                    now,
+                );
+            }
+            tokio::time::sleep(code_chunk_timeout).await;
+
+            {
+                let comm_state = comm_state
+                    .try_lock()
+                    .expect("comm_state lock cannot be held across an .await");
+                // Make sure there aren't other messages floating around the network
+                assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
+            }
+        }
+
+        info!("Checking progress");
+        {
+            let now = Instant::now();
+            let mut comm_state = comm_state
+                .try_lock()
+                .expect("comm_state lock cannot be held across an .await");
+            let mut trickle_state = trickle_state
+                .try_lock()
+                .expect("trickle_state lock cannot be held across an .await");
+            seq_num = comm_state.seq_num + 1;
+            new_comm_state(
+                CommState {
+                    seq_num,
+                    type_: CommType::BlCodeProgress(BlCodeProgress {
+                        hardware_id: HARDWARE_ID,
+                        chunk_count: chunk_count as u32,
+                    }),
+                },
+                &mut *comm_state,
+                &mut *trickle_state,
+                &trickle_notify_tx,
+                &new_comm_state_notify_tx,
+                now,
+            );
+        }
+        tokio::time::sleep(LONG_TIMEOUT).await;
+
+        let chunk_count_progress = {
+            let comm_state = comm_state
+                .try_lock()
+                .expect("comm_state lock cannot be held across an .await");
+            // Make sure there aren't other messages floating around the network
+            assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
+            match comm_state.type_ {
+                CommType::BlCodeProgress(BlCodeProgress {
+                    hardware_id: _,
+                    chunk_count,
+                }) => chunk_count,
+                _ => panic!("msg type changed unexpectedly on network"), // TODO better error handling
+            }
+        };
+        info!(
+            "- Smallest chunk count on the network is {}",
+            chunk_count_progress
+        );
+
+        if chunk_count_progress as usize == chunk_count {
+            break; // All done
+        } else {
+            // Need to retransmit some chunks
+            first_chunk = chunk_count_progress as usize;
+            code_chunk_timeout =
+                Duration::from_secs_f64(code_chunk_timeout.as_secs_f64() * 1.2);
+        }
+    }
+
+    info!("Switching back to app");
+    {
+        let now = Instant::now();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        let mut trickle_state = trickle_state
+            .try_lock()
+            .expect("trickle_state lock cannot be held across an .await");
+        seq_num = comm_state.seq_num + 1;
+        new_comm_state(
+            CommState {
+                seq_num,
+                type_: CommType::Init,
+            },
+            &mut *comm_state,
+            &mut *trickle_state,
+            &trickle_notify_tx,
+            &new_comm_state_notify_tx,
+            now,
+        );
+    }
+    tokio::time::sleep(LONG_TIMEOUT).await;
+}
+
+async fn bootloader_command(
+    comm_state: &Mutex<CommState>,
+    trickle_state: &Mutex<TrickleState<'static>>,
+    trickle_notify_tx: &watch::Sender<()>,
+    new_comm_state_notify_tx: &watch::Sender<()>,
+    mut new_comm_state_notify_rx: watch::Receiver<()>,
+) {
+    info!("Starting bootloader mode - sending BlInit packets continuously...");
+
+    // Initial BlInit
+    let mut seq_num = {
+        let now = Instant::now();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        let mut trickle_state = trickle_state
+            .try_lock()
+            .expect("trickle_state lock cannot be held across an .await");
+        let seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+        new_comm_state(
+            CommState {
+                seq_num,
+                type_: CommType::BlInit,
+            },
+            &mut *comm_state,
+            &mut *trickle_state,
+            &trickle_notify_tx,
+            &new_comm_state_notify_tx,
+            now,
+        );
+        seq_num
+    };
+
+    // Endless loop sending BlInit
+    loop {
+        new_comm_state_notify_rx.changed().await.unwrap();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        if comm_state.seq_num > seq_num {
+            // One-up the message with an even higher seq_num
+            seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+            let mut trickle_state = trickle_state
+                .try_lock()
+                .expect("trickle_state lock cannot be held across an .await");
+            let now = Instant::now();
+            new_comm_state(
+                CommState {
+                    seq_num,
+                    type_: CommType::BlInit,
+                },
+                &mut *comm_state,
+                &mut *trickle_state,
+                &trickle_notify_tx,
+                &new_comm_state_notify_tx,
+                now,
+            );
+        }
+    }
+}
+
+async fn test_command(
+    comm_state: &Mutex<CommState>,
+    trickle_state: &Mutex<TrickleState<'static>>,
+    trickle_notify_tx: &watch::Sender<()>,
+    new_comm_state_notify_tx: &watch::Sender<()>,
+    mut new_comm_state_notify_rx: watch::Receiver<()>,
+) {
+    info!("Starting test mode - sending BlIndicateGood packets continuously...");
+
+    // Initial BlIndicateGood
+    let mut seq_num = {
+        let now = Instant::now();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        let mut trickle_state = trickle_state
+            .try_lock()
+            .expect("trickle_state lock cannot be held across an .await");
+        let seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+        new_comm_state(
+            CommState {
+                seq_num,
+                type_: CommType::BlIndicateGood,
+            },
+            &mut *comm_state,
+            &mut *trickle_state,
+            &trickle_notify_tx,
+            &new_comm_state_notify_tx,
+            now,
+        );
+        seq_num
+    };
+
+    // Endless loop sending BlIndicateGood
+    loop {
+        new_comm_state_notify_rx.changed().await.unwrap();
+        let mut comm_state = comm_state
+            .try_lock()
+            .expect("comm_state lock cannot be held across an .await");
+        if comm_state.seq_num > seq_num {
+            // One-up the message with an even higher seq_num
+            seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
+            let mut trickle_state = trickle_state
+                .try_lock()
+                .expect("trickle_state lock cannot be held across an .await");
+            let now = Instant::now();
+            new_comm_state(
+                CommState {
+                    seq_num,
+                    type_: CommType::BlIndicateGood,
+                },
+                &mut *comm_state,
+                &mut *trickle_state,
+                &trickle_notify_tx,
+                &new_comm_state_notify_tx,
+                now,
+            );
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let cli = Cli::parse();
+
+    // Open serial port
+    let port = tokio_serial::new(&cli.serial_port, 115_200).open_native_async()?;
+
+    info!("Opened serial port: {}", cli.serial_port);
 
     // Split the port for RX and TX
     let (serial_rx, serial_tx) = tokio::io::split(port);
@@ -191,7 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let comm_state = Mutex::new(CommState::default());
     let trickle_state = Mutex::new(TrickleState::new(&TRICKLE_PARAMS, now, seed));
     let (trickle_notify_tx, trickle_notify_rx) = watch::channel(());
-    let (new_comm_state_notify_tx, mut new_comm_state_notify_rx) = watch::channel(());
+    let (new_comm_state_notify_tx, new_comm_state_notify_rx) = watch::channel(());
 
     // Spawn tasks
     let rx_handle = rx_task(
@@ -202,235 +581,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &new_comm_state_notify_tx,
     );
     let tx_handle = tx_task(serial_tx, &comm_state, &trickle_state, trickle_notify_rx);
+
     let main_handle = async {
-        // Switch to bootloader mode
-        let mut seq_num = 0;
-        info!("Switching to bootloader...");
-        let switch_to_bl = async {
-            {
-                let now = Instant::now();
-                let mut comm_state = comm_state
-                    .try_lock()
-                    .expect("comm_state lock cannot be held across an .await");
-                let mut trickle_state = trickle_state
-                    .try_lock()
-                    .expect("trickle_state lock cannot be held across an .await");
-                seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
-                new_comm_state(
-                    CommState {
-                        seq_num,
-                        type_: CommType::BlInit,
-                    },
-                    &mut *comm_state,
-                    &mut *trickle_state,
+        match cli.command {
+            Commands::Flash { firmware_binary } => {
+                flash_command(
+                    &firmware_binary,
+                    &comm_state,
+                    &trickle_state,
                     &trickle_notify_tx,
                     &new_comm_state_notify_tx,
-                    now,
-                );
+                    new_comm_state_notify_rx,
+                )
+                .await;
             }
-            loop {
-                new_comm_state_notify_rx.changed().await.unwrap(); // TODO real error handling here
-                let mut comm_state = comm_state
-                    .try_lock()
-                    .expect("comm_state lock cannot be held across an .await");
-                if comm_state.seq_num > seq_num {
-                    // Update with higher seq_num:
-                    // One-up the message with an even higher seq_num
-                    seq_num = comm_state.seq_num + HIGH_PRIORITY_SEQ_INCREMENT;
-                    let mut trickle_state = trickle_state
-                        .try_lock()
-                        .expect("trickle_state lock cannot be held across an .await");
-                    new_comm_state(
-                        CommState {
-                            seq_num,
-                            type_: CommType::BlInit,
-                        },
-                        &mut *comm_state,
-                        &mut *trickle_state,
-                        &trickle_notify_tx,
-                        &new_comm_state_notify_tx,
-                        now,
-                    );
-                }
-            }
-        };
-        let _ = timeout(LONG_TIMEOUT, switch_to_bl).await;
-
-        info!("Measuring network latency...");
-        {
-            let now = Instant::now();
-            let mut comm_state = comm_state
-                .try_lock()
-                .expect("comm_state lock cannot be held across an .await");
-            let mut trickle_state = trickle_state
-                .try_lock()
-                .expect("trickle_state lock cannot be held across an .await");
-            seq_num = comm_state.seq_num + 1;
-            new_comm_state(
-                CommState {
-                    seq_num,
-                    type_: CommType::BlBroadcastPing(BlBroadcastPing {
-                        data: heapless::Vec::from_slice(&[0xAA; CHUNK_SIZE]).unwrap(),
-                        ..Default::default()
-                    }),
-                },
-                &mut *comm_state,
-                &mut *trickle_state,
-                &trickle_notify_tx,
-                &new_comm_state_notify_tx,
-                now,
-            );
-        }
-
-        tokio::time::sleep(LONG_TIMEOUT).await;
-
-        let latency_micros = {
-            let comm_state = comm_state
-                .try_lock()
-                .expect("comm_state lock cannot be held across an .await");
-            // Make sure there aren't other messages floating around the network
-            assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
-            match comm_state.type_ {
-                CommType::BlBroadcastPing(BlBroadcastPing { latency_micros, .. }) => latency_micros,
-                _ => panic!("msg type changed unexpectedly on network"), // TODO better error handling
-            }
-        };
-
-        if latency_micros == 0 {
-            panic!("No devices detected on network"); // TODO better error handling
-        }
-
-        info!(
-            " - Measured latency: {} milliseconds",
-            latency_micros / 1_000
-        );
-
-        let mut code_chunk_timeout = INITIAL_CODE_CHUNK_TIMEOUT;
-        let mut first_chunk = 0;
-
-        loop {
-            // Split firmware into 256-byte chunks
-            let firmware_chunks = firmware_data[first_chunk * CHUNK_SIZE..].chunks(CHUNK_SIZE);
-            for (chunk_index, chunk_data) in firmware_chunks.enumerate() {
-                let chunk_index = chunk_index + first_chunk;
-                info!("Write chunk {} / {}", chunk_index, chunk_count);
-                {
-                    let now = Instant::now();
-                    let mut comm_state = comm_state
-                        .try_lock()
-                        .expect("comm_state lock cannot be held across an .await");
-                    let mut trickle_state = trickle_state
-                        .try_lock()
-                        .expect("trickle_state lock cannot be held across an .await");
-                    seq_num = comm_state.seq_num + 1;
-                    new_comm_state(
-                        CommState {
-                            seq_num,
-                            type_: CommType::BlCodeWrite(BlCodeWrite {
-                                hardware_id: HARDWARE_ID,
-                                firmware_size_bytes: firmware_data.len() as u32,
-                                firmware_crc32,
-                                chunk_index: chunk_index as u32,
-                                chunk_data: heapless::Vec::from_slice(chunk_data).unwrap(),
-                            }),
-                        },
-                        &mut *comm_state,
-                        &mut *trickle_state,
-                        &trickle_notify_tx,
-                        &new_comm_state_notify_tx,
-                        now,
-                    );
-                }
-                tokio::time::sleep(code_chunk_timeout).await;
-
-                {
-                    let comm_state = comm_state
-                        .try_lock()
-                        .expect("comm_state lock cannot be held across an .await");
-                    // Make sure there aren't other messages floating around the network
-                    assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
-                }
-            }
-
-            info!("Checking progress");
-            {
-                let now = Instant::now();
-                let mut comm_state = comm_state
-                    .try_lock()
-                    .expect("comm_state lock cannot be held across an .await");
-                let mut trickle_state = trickle_state
-                    .try_lock()
-                    .expect("trickle_state lock cannot be held across an .await");
-                seq_num = comm_state.seq_num + 1;
-                new_comm_state(
-                    CommState {
-                        seq_num,
-                        type_: CommType::BlCodeProgress(BlCodeProgress {
-                            hardware_id: HARDWARE_ID,
-                            chunk_count: chunk_count as u32,
-                        }),
-                    },
-                    &mut *comm_state,
-                    &mut *trickle_state,
+            Commands::Bootloader => {
+                bootloader_command(
+                    &comm_state,
+                    &trickle_state,
                     &trickle_notify_tx,
                     &new_comm_state_notify_tx,
-                    now,
-                );
+                    new_comm_state_notify_rx,
+                )
+                .await;
             }
-            tokio::time::sleep(LONG_TIMEOUT).await;
-
-            let chunk_count_progress = {
-                let comm_state = comm_state
-                    .try_lock()
-                    .expect("comm_state lock cannot be held across an .await");
-                // Make sure there aren't other messages floating around the network
-                assert_eq!(comm_state.seq_num, seq_num); // TODO better error handling
-                match comm_state.type_ {
-                    CommType::BlCodeProgress(BlCodeProgress {
-                        hardware_id: _,
-                        chunk_count,
-                    }) => chunk_count,
-                    _ => panic!("msg type changed unexpectedly on network"), // TODO better error handling
-                }
-            };
-            info!(
-                "- Smallest chunk count on the network is {}",
-                chunk_count_progress
-            );
-
-            if chunk_count_progress as usize == chunk_count {
-                break; // All done
-            } else {
-                // Need to retransmit some chunks
-                first_chunk = chunk_count_progress as usize;
-                code_chunk_timeout =
-                    Duration::from_secs_f64(code_chunk_timeout.as_secs_f64() * 1.2);
+            Commands::Test => {
+                test_command(
+                    &comm_state,
+                    &trickle_state,
+                    &trickle_notify_tx,
+                    &new_comm_state_notify_tx,
+                    new_comm_state_notify_rx,
+                )
+                .await;
             }
         }
-
-        info!("Switching back to app");
-        {
-            let now = Instant::now();
-            let mut comm_state = comm_state
-                .try_lock()
-                .expect("comm_state lock cannot be held across an .await");
-            let mut trickle_state = trickle_state
-                .try_lock()
-                .expect("trickle_state lock cannot be held across an .await");
-            seq_num = comm_state.seq_num + 1;
-            new_comm_state(
-                CommState {
-                    seq_num,
-                    type_: CommType::Init,
-                },
-                &mut *comm_state,
-                &mut *trickle_state,
-                &trickle_notify_tx,
-                &new_comm_state_notify_tx,
-                now,
-            );
-        }
-        tokio::time::sleep(LONG_TIMEOUT).await;
     };
 
     // Wait for any task to complete (exit when any task returns)
