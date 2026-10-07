@@ -4,7 +4,7 @@
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
 use hal::{Direction, Flash, Hardware, LedPwr, Leds, Touch, UsartRx, UsartTx, Watchdog};
-use proto::{CommState, CommType, MAX_PACKET_LEN, MergeResult, TRICKLE_PARAMS};
+use proto::{CommState, CommType, MAX_PACKET_LEN, MergeResult, TRICKLE_PARAMS, Waves};
 use static_cell::StaticCell;
 use trickle::{TricklePollResult, TrickleState};
 
@@ -28,7 +28,10 @@ static GLOBAL_STATE: StaticCell<(
     Config,
 )> = StaticCell::new();
 
-struct AppState;
+struct AppState {
+    t: i32,
+    origin: bool,
+}
 
 #[derive(defmt::Format)]
 #[repr(C)]
@@ -115,7 +118,7 @@ impl TouchState {
         const BASE: u32 = 16384;
         const UP_ALPHA: f32 = 0.1;
         const DOWN_ALPHA: f32 = 0.01;
-        const THRESH_TOUCH: f32 = 0.75;
+        const THRESH_TOUCH: f32 = 0.6;
         const THRESH_RELEASE: f32 = 0.9;
 
         let val = touch.read().await;
@@ -143,15 +146,23 @@ impl TouchState {
         };
 
         let touched = val < (self.last as u32 * thresh as u32 / BASE) as u16;
+        let newly_touched = touched && !self.last_touched;
         self.last_touched = touched;
 
-        touched
+        newly_touched
     }
 }
 
 #[embassy_executor::task]
-async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog, config: &'static Config) {
-    const FRAME_INTERVAL_MS: u64 = 33; // ~1/30th of a second
+async fn main_task(
+    mut leds: Leds,
+    mut touch: Touch,
+    watchdog: Watchdog,
+    config: &'static Config,
+    app_state: &'static Mutex<NoopRawMutex, AppState>,
+    directions: [(Direction, &'static DirectionState); 4],
+) {
+    const FRAME_INTERVAL_MS: u64 = 16; // ~1/60th of a second
 
     let mut buffer = [0u8; MAX_PIXEL_COUNT * 3];
     let mut time_offset: u16 = 0;
@@ -160,19 +171,49 @@ async fn main_task(mut leds: Leds, mut touch: Touch, watchdog: Watchdog, config:
 
     Timer::after_millis(100).await; // Avoid startup state transients that may flash the LEDs
     loop {
-        let touched = touch_state.update(&mut touch).await;
+        let newly_touched = touch_state.update(&mut touch).await;
+
+        if newly_touched {
+            let mut app_state = app_state
+                .try_lock()
+                .expect("app_state lock should not be held across .awaits");
+
+            app_state.t = -50;
+            app_state.origin = true;
+
+            propagate_internal_comm_state_change(
+                |_direction, comm_state| {
+                    comm_state.seq_num += 1;
+                    comm_state.type_ = CommType::Waves(Waves { radius: 1 })
+                },
+                directions,
+                Instant::now(),
+            );
+        }
 
         // Generate rainbow pattern
-        for pixel in 0..config.pixel_count {
-            // Hue varies with position: spread across full color wheel
-            let position_hue = (pixel * 1536 / config.pixel_count) as u16;
-            let hue = (position_hue + time_offset) % 1536;
+        {
+            let mut app_state = app_state
+                .try_lock()
+                .expect("app_state lock should not be held across .awaits");
+            for pixel in 0..config.pixel_count {
+                let (r, g, b) = gamma_correct(if app_state.t < 0 && !app_state.origin {
+                    (0, 0, 0)
+                } else {
+                    let wave_center = app_state.t.abs();
+                    if (pixel as i32) >= wave_center - 5 && (pixel as i32) < wave_center + 5 {
+                        (0, 0, 80)
+                    } else {
+                        (0, 0, 0)
+                    }
+                });
 
-            let (r, g, b) = gamma_correct(hsv2rgb(hue as u16, 255, if touched { 100 } else { 25 }));
+                buffer[(pixel * 3) as usize] = g;
+                buffer[(pixel * 3 + 1) as usize] = r;
+                buffer[(pixel * 3 + 2) as usize] = b;
+            }
 
-            buffer[(pixel * 3) as usize] = g;
-            buffer[(pixel * 3 + 1) as usize] = r;
-            buffer[(pixel * 3 + 2) as usize] = b;
+            app_state.t += 1;
         }
 
         let _ = leds.write_slice(&buffer);
@@ -252,23 +293,23 @@ async fn rx_task(
                                             "comm_state lock should not be held across .awaits",
                                         );
 
-                                    propagate_comm_state(
-                                        direction,
-                                        &mut *comm_state,
+                                    let mut new_comm_state = comm_state.clone();
+                                    propagate_one_external_change(
+                                        &mut new_comm_state,
+                                        Some(direction),
                                         other_direction,
-                                        &mut *other_comm_state,
                                     );
-                                    // Bootloader has very simple propagation:
-                                    // clone an exact copy to all other directions
-                                    *other_comm_state = comm_state.clone();
+                                    let merge_result = other_comm_state.merge(&new_comm_state);
 
-                                    let mut other_trickle_state = other_direction_state
-                                        .trickle_state
-                                        .try_lock()
-                                        .expect("trickle lock should not be held across .awaits");
-                                    other_trickle_state.got_inconsistent_state(now);
-                                    // Wake the event loop
-                                    other_direction_state.trickle_signal.signal(());
+                                    if merge_result.newer {
+                                        let mut other_trickle_state =
+                                            other_direction_state.trickle_state.try_lock().expect(
+                                                "trickle lock should not be held across .awaits",
+                                            );
+                                        other_trickle_state.got_inconsistent_state(now);
+                                        // Wake the event loop
+                                        other_direction_state.trickle_signal.signal(());
+                                    }
                                 }
                             }
                         }
@@ -309,7 +350,7 @@ async fn rx_task(
 fn handle_new_message(
     _direction: Direction,
     comm_state: &mut CommState,
-    _app_state: &mut AppState,
+    app_state: &mut AppState,
     bootloader_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
     // Handle updating app_state
@@ -317,6 +358,10 @@ fn handle_new_message(
 
     let CommState { seq_num: _, type_ } = &mut *comm_state;
     match type_ {
+        CommType::Waves(waves) => {
+            app_state.t = -50 - waves.radius as i32 * 5;
+            app_state.origin = false;
+        }
         CommType::BlUnknown => {
             // Reboot into bootloader
             bootloader_signal.signal(());
@@ -325,14 +370,44 @@ fn handle_new_message(
     }
 }
 
-fn propagate_comm_state(
-    _from_dir: Direction,
-    from_comm_state: &CommState,
+fn propagate_one_external_change(
+    comm_state: &mut CommState,
+    _from_dir: Option<Direction>,
     _to_dir: Direction,
-    to_comm_state: &mut CommState,
-) -> bool {
-    *to_comm_state = from_comm_state.clone();
-    true
+) {
+    match &mut comm_state.type_ {
+        CommType::Waves(waves) => {
+            waves.radius += 1;
+        }
+        _ => {}
+    }
+}
+
+fn propagate_internal_comm_state_change(
+    propagate: impl Fn(Direction, &mut CommState),
+    direction_states: [(Direction, &'static DirectionState); 4],
+    now: Instant,
+) {
+    for (direction, direction_state) in direction_states {
+        let mut other_comm_state = direction_state
+            .comm_state
+            .try_lock()
+            .expect("comm_state lock should not be held across .awaits");
+
+        let mut comm_state = other_comm_state.clone();
+        propagate(direction, &mut comm_state);
+        let merge_result = other_comm_state.merge(&comm_state);
+
+        if merge_result.newer {
+            let mut trickle_state = direction_state
+                .trickle_state
+                .try_lock()
+                .expect("trickle lock should not be held across .awaits");
+            trickle_state.got_inconsistent_state(now);
+            // Wake the event loop
+            direction_state.trickle_signal.signal(());
+        }
+    }
 }
 
 #[embassy_executor::task(pool_size = 4)]
@@ -634,13 +709,28 @@ async fn init(
     });
 
     // Initialize shared state
-    let app_state = Mutex::new(AppState);
+    let app_state = Mutex::new(AppState { t: 0, origin: false });
     let bootloader_signal = Signal::new();
     let (app_state, bootloader_signal, config) =
         GLOBAL_STATE.init((app_state, bootloader_signal, config));
 
     spawner.spawn(led_pwr_task(led_pwr).unwrap());
-    spawner.spawn(main_task(leds, touch, watchdog, config).unwrap());
+    spawner.spawn(
+        main_task(
+            leds,
+            touch,
+            watchdog,
+            config,
+            app_state,
+            [
+                (Direction::North, north_state),
+                (Direction::South, south_state),
+                (Direction::East, east_state),
+                (Direction::West, west_state),
+            ],
+        )
+        .unwrap(),
+    );
     spawner.spawn(branch_task(bootloader_signal).unwrap());
 
     // Spawn RX tasks for each direction

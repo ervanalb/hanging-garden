@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 #[allow(unused)]
 use embassy_time::{Duration, Instant};
 
-use core::array;
 use core::marker::PhantomData;
 
 use serde::de;
@@ -53,15 +52,6 @@ pub struct CommState {
     pub type_: CommType,
 }
 
-/*
-impl TrickleOrd for CommState {
-    fn consider(&self, other: &Self) -> trickle::TrickleOrdering {
-        let consider_seq_num = TrickleOrdering::from(other.seq_num.cmp(&self.seq_num));
-        consider_seq_num.then_with(|| self.type_.consider(&other.type_))
-    }
-}
-*/
-
 impl CommState {
     pub fn update(&mut self, now: Instant) {
         self.type_.update(now);
@@ -77,13 +67,6 @@ impl CommState {
         }
         // seq_num is equal
         return self.type_.merge(&other.type_);
-    }
-
-    pub fn propagate(&self) -> [Self; 4] {
-        self.type_.propagate().map(|type_| CommState {
-            seq_num: self.seq_num,
-            type_,
-        })
     }
 
     pub fn try_deserialize_packet(s: &mut [u8]) -> postcard::Result<Self> {
@@ -131,6 +114,7 @@ impl CommState {
 }
 
 pub const COMM_TYPE_INIT: u8 = 0x00;
+pub const COMM_TYPE_WAVES: u8 = 0x01;
 pub const COMM_TYPE_UNKNOWN: u8 = 0xEF;
 pub const COMM_TYPE_BL_INIT: u8 = 0xF0;
 pub const COMM_TYPE_BL_BROADCAST_PING: u8 = 0xF1;
@@ -151,6 +135,8 @@ pub const COMM_TYPE_BL_BITMASK: u8 = COMM_TYPE_BL_INIT;
 pub enum CommType {
     #[cfg(feature = "app")]
     Init = COMM_TYPE_INIT,
+    #[cfg(feature = "app")]
+    Waves(Waves) = COMM_TYPE_WAVES,
     Unknown = COMM_TYPE_UNKNOWN,
     #[cfg(feature = "bl")]
     BlInit = COMM_TYPE_BL_INIT,
@@ -181,6 +167,14 @@ impl Serialize for CommType {
                 "CommType",
                 COMM_TYPE_INIT as u32,
                 "Init",
+            ),
+            #[cfg(feature = "app")]
+            CommType::Waves(ref data) => Serializer::serialize_newtype_variant(
+                serializer,
+                "CommType",
+                COMM_TYPE_WAVES as u32,
+                "Waves",
+                data,
             ),
             CommType::Unknown => Serializer::serialize_unit_variant(
                 serializer,
@@ -277,6 +271,11 @@ impl<'de> Deserialize<'de> for CommType {
                         de::VariantAccess::unit_variant(variant)?;
                         Ok(CommType::Init)
                     }
+                    #[cfg(feature = "app")]
+                    Ok((COMM_TYPE_WAVES, variant)) => Result::map(
+                        de::VariantAccess::newtype_variant::<Waves>(variant),
+                        CommType::Waves,
+                    ),
                     #[cfg(feature = "bl")]
                     Ok((COMM_TYPE_BL_INIT, variant)) => {
                         de::VariantAccess::unit_variant(variant)?;
@@ -318,6 +317,8 @@ impl<'de> Deserialize<'de> for CommType {
         const VARIANTS: &'static [&'static str] = &[
             #[cfg(feature = "app")]
             "Init",
+            #[cfg(feature = "app")]
+            "Waves",
             "Unknown",
             #[cfg(feature = "bl")]
             "BlInit",
@@ -374,37 +375,12 @@ impl CommType {
         }
     }
 
-    pub fn propagate(&self) -> [Self; 4] {
-        match self {
-            #[cfg(feature = "app")]
-            CommType::Init => array::from_fn(|_| Self::Init),
-            CommType::Unknown => array::from_fn(|_| Self::Unknown),
-            #[cfg(feature = "bl")]
-            CommType::BlInit => array::from_fn(|_| Self::BlInit),
-            #[cfg(feature = "bl")]
-            CommType::BlBroadcastPing(data) => {
-                array::from_fn(|_| Self::BlBroadcastPing(data.clone()))
-            }
-            #[cfg(feature = "bl")]
-            CommType::BlCodeWrite(data) => array::from_fn(|_| Self::BlCodeWrite(data.clone())),
-            #[cfg(feature = "bl")]
-            CommType::BlCodeProgress(data) => {
-                array::from_fn(|_| Self::BlCodeProgress(data.clone()))
-            }
-            #[cfg(feature = "bl")]
-            CommType::BlIndicateGood => array::from_fn(|_| Self::BlIndicateGood),
-            CommType::BlUnknown => array::from_fn(|_| Self::BlUnknown),
-            #[cfg(test)]
-            CommType::TestAppUnknown(data) => array::from_fn(|_| Self::TestAppUnknown(*data)),
-            #[cfg(test)]
-            CommType::TestBlUnknown(data) => array::from_fn(|_| Self::TestBlUnknown(*data)),
-        }
-    }
-
     pub fn merge(&mut self, other: &Self) -> MergeResult {
         match (&mut *self, other) {
             #[cfg(feature = "app")]
             (CommType::Init, CommType::Init) => MergeResult::CONSISTENT,
+            #[cfg(feature = "app")]
+            (CommType::Waves(s), CommType::Waves(o)) => s.merge(o),
             (CommType::Unknown, CommType::Unknown) => MergeResult::CONSISTENT,
             #[cfg(feature = "bl")]
             (CommType::BlInit, CommType::BlInit) => MergeResult::CONSISTENT,
@@ -449,45 +425,6 @@ impl CommType {
             }
         }
     }
-
-    /*
-    pub fn consider(&self, other: &Self) -> TrickleOrdering {
-        match (self, other) {
-            #[cfg(feature = "app")]
-            (CommType::Init, CommType::Init) => TrickleOrdering::Consistent,
-            (CommType::Unknown, CommType::Unknown) => TrickleOrdering::Consistent,
-            #[cfg(feature = "bl")]
-            (CommType::BlInit, CommType::BlInit) => TrickleOrdering::Consistent,
-            #[cfg(feature = "bl")]
-            (CommType::BlBroadcastPing(s), CommType::BlBroadcastPing(o)) => s.consider(o),
-            #[cfg(feature = "bl")]
-            (CommType::BlCodeWrite(s), CommType::BlCodeWrite(o)) => s.consider(o),
-            #[cfg(feature = "bl")]
-            (CommType::BlCodeProgress(s), CommType::BlCodeProgress(o)) => s.consider(o),
-            #[cfg(feature = "bl")]
-            (CommType::BlIndicateGood, CommType::BlIndicateGood) => TrickleOrdering::Consistent,
-            (CommType::BlUnknown, CommType::BlUnknown) => TrickleOrdering::Consistent,
-            #[cfg(test)]
-            (CommType::TestAppUnknown(_), CommType::TestAppUnknown(_)) => {
-                TrickleOrdering::Consistent
-            }
-            #[cfg(test)]
-            (CommType::TestBlUnknown(_), CommType::TestBlUnknown(_)) => TrickleOrdering::Consistent,
-            (s, CommType::Unknown) if !s.is_bl() => TrickleOrdering::Consistent,
-            (CommType::Unknown, o) if !o.is_bl() => TrickleOrdering::Greater,
-            (s, CommType::BlUnknown) if s.is_bl() => TrickleOrdering::Consistent,
-            (CommType::BlUnknown, o) if o.is_bl() => TrickleOrdering::Greater,
-            (s, o) => {
-                // First compare by domain: app types (false) are Greater than BL types (true)
-                s.is_bl()
-                    .cmp(&o.is_bl())
-                    // Then within same domain: higher discriminant is Greater
-                    .then(o.discriminant().cmp(&s.discriminant()))
-                    .into()
-            }
-        }
-    }
-    */
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -516,6 +453,27 @@ impl AgeMicros {
         } else {
             // First update--assume this is done quickly after we receive the age
             self.last_update = Some(now);
+        }
+    }
+}
+
+#[cfg(feature = "app")]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, defmt::Format)]
+pub struct Waves {
+    pub radius: u16,
+}
+
+#[cfg(feature = "app")]
+impl Waves {
+    pub fn merge(&mut self, other: &Self) -> MergeResult {
+        // Reverse radius comparison so that lower radius wins
+        match other.radius.cmp(&self.radius).reverse() {
+            Ordering::Greater => {
+                *self = other.clone();
+                MergeResult::NEWER
+            }
+            Ordering::Equal => MergeResult::CONSISTENT,
+            Ordering::Less => MergeResult::OLDER,
         }
     }
 }
